@@ -75,21 +75,20 @@ void print_logo(void)
         }
     }
 
-    w(VT_BRIGHT_BLACK VT_BOLD);
-    // ENux branding because why not
+    w("\033[90m\033[1m");
 
-    w("eeeeeeeeeeeeeeeeeeeeeeeee\n");
-    w("eeeeeeeeeeeeeeeeeeeeeeeee\n");
-    w("eeeee\n");
-    w("eeeee\n");
-    w("eeeee\n");
-    w("eeeeeeeeeeeeeeeeeeeeeeeee\n");
-    w("eeeeeeeeeeeeeeeeeeeeeeeee\n");
-    w("eeeee\n");
-    w("eeeee\n");
-    w("eeeee\n");
-    w("eeeeeeeeeeeeeeeeeeeeeeeee\n");
-    w("eeeeeeeeeeeeeeeeeeeeeeeee\n");
+w("eeeeeeeeeeeeeeeeeeeeeeeee\n");
+w("eeeeeeeeeeeeeeeeeeeeeeeee\n");
+w("eeeee\n");
+w("eeeee\n");
+w("eeeee\n");
+w("eeeeeeeeeeeeeeeeeeeeeeeee\n");
+w("eeeeeeeeeeeeeeeeeeeeeeeee\n");
+w("eeeee\n");
+w("eeeee\n");
+w("eeeee\n");
+w("eeeeeeeeeeeeeeeeeeeeeeeee\n");
+w("eeeeeeeeeeeeeeeeeeeeeeeee\n");
 
 w(VT_RESET);
 wf("  ENux %s\n\n", release);
