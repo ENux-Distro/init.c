@@ -7,6 +7,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 
 #include "init.h"
 
@@ -22,6 +23,21 @@ void panic(const char *fmt, ...)
     asm_write_str(STDERR_FILENO, COL_RED "FATAL: " COL_RESET);
     asm_write_str(STDERR_FILENO, buf);
     asm_write_str(STDERR_FILENO, "\n\n");
+
+    /* Try fallback init before giving up */
+    static const char *fallback_candidates[] = {
+        "/sbin/init",
+        NULL
+    };
+
+    for (int i = 0; fallback_candidates[i]; i++) {
+        if (access(fallback_candidates[i], X_OK) == 0) {
+            asm_write_str(STDERR_FILENO, "Attempting fallback init...\n\n");
+            execv(fallback_candidates[i],
+                  (char *[]){ (char *)fallback_candidates[i], NULL });
+        }
+    }
+
     asm_write_str(STDERR_FILENO, "Starting emergency shell. Good luck.\n\n");
 
     /* exec sh — last resort */
