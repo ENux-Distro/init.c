@@ -112,6 +112,8 @@ static int fs_available(const char *fstype)
  *
  * All of these are syscalls or at most one fork each — no grep, no awk,
  * no shell string splitting.
+ *
+ * Uses is_mounted() to skip already-mounted filesystems (first call).
  */
 void ensure_essential_environment(void)
 {
@@ -223,6 +225,62 @@ void ensure_essential_environment(void)
             S_ISLNK(lst.st_mode)) {
             unlink("/etc/resolv.conf");
         }
+    }
+}
+
+/*
+ * remount_essential_after_pivot()
+ *
+ * Called after pivot_root to force-remount /proc, /sys, /dev, /run
+ * unconditionally. After pivot the old root's mounts are gone or stale,
+ * and /proc/mounts may not reflect the new root. Unlike
+ * ensure_essential_environment(), this does NOT check is_mounted() —
+ * it always tries to mount and accepts EBUSY as success.
+ */
+void remount_essential_after_pivot(void)
+{
+    /* Always try to re-establish /proc — do NOT check is_mounted
+     * because /proc/mounts may be stale or missing after pivot. */
+    ensure_dir("/proc");
+    if (mount("proc", "/proc", "proc",
+              MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL) < 0) {
+        if (errno != EBUSY)
+            notice(COL_YELLOW "warn" COL_RESET ": mount proc: %s", strerror(errno));
+    }
+
+    /* /sys */
+    ensure_dir("/sys");
+    if (mount("sysfs", "/sys", "sysfs",
+              MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL) < 0) {
+        if (errno != EBUSY)
+            notice(COL_YELLOW "warn" COL_RESET ": mount sysfs: %s", strerror(errno));
+    }
+
+    /* /dev */
+    ensure_dir("/dev");
+    if (mount("devtmpfs", "/dev", "devtmpfs",
+              MS_NOSUID | MS_STRICTATIME,
+              "mode=0755,size=10M") < 0) {
+        if (errno != EBUSY)
+            notice(COL_YELLOW "warn" COL_RESET ": mount devtmpfs: %s", strerror(errno));
+    }
+
+    /* /dev/pts */
+    ensure_dir("/dev/pts");
+    if (mount("devpts", "/dev/pts", "devpts",
+              MS_NOSUID | MS_NOEXEC,
+              "mode=0620,gid=5,ptmxmode=0666") < 0) {
+        if (errno != EBUSY)
+            notice(COL_YELLOW "warn" COL_RESET ": mount devpts: %s", strerror(errno));
+    }
+
+    /* /run */
+    ensure_dir("/run");
+    if (mount("tmpfs", "/run", "tmpfs",
+              MS_NOSUID | MS_NODEV | MS_STRICTATIME,
+              "mode=0755,size=20%") < 0) {
+        if (errno != EBUSY)
+            notice(COL_YELLOW "warn" COL_RESET ": mount tmpfs: %s", strerror(errno));
     }
 }
 
