@@ -26,6 +26,10 @@ init.h
 #define COL_BOLD    "\033[1m"
 #define COL_DIM     "\033[2m"
 
+#define DEFAULT_PATH "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+#define BEDROCK_INIT_BACKUP    "/bedrock/strata/bedrock/sbin/init.sh.bak"
+#define BEDROCK_INIT_BIN_BAK   "/bedrock/strata/bedrock/sbin/init.bin.bak"
+
 typedef struct {
     char name[MAX_NAME_LEN];       /* stratum name, e.g. "arch" */
     char root[MAX_PATH_LEN];       /* /bedrock/strata/<name>    */
@@ -48,6 +52,7 @@ typedef struct {
 
 /* env.c */
 void ensure_essential_environment(void);
+void remount_essential_after_pivot(void);
 void setup_term(void);
 
 /* mount.c */
@@ -62,6 +67,7 @@ void enable_stratum(const Stratum *s, int skip_crossfs);
 
 /* menu.c */
 void print_logo(void);
+void run_fallback_menu(char **argv);
 int  run_menu(InitState *st);   /* returns chosen index */
 
 /* conf.c */
