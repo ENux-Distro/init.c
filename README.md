@@ -1,6 +1,6 @@
 # init.c
 
-init.c replaces Bedrock Linux's shell-based init (`/bedrock/strata/bedrock/sbin/init`) with a minimal C + x86_64 ASM static binary. It does the same job: pivot into the chosen stratum, enable all strata, hand off to the real init, but it's 10% faster than Bedrock Linux's init.
+init.c replaces Bedrock Linux's shell-based init (`/bedrock/strata/bedrock/sbin/init`) with a minimal C + x86_64 ASM static binary. It does the same job: pivot into the chosen stratum, enable all strata, hand off to the real init, but it's ~10%* faster than Bedrock Linux's init.
 
 ## Why init.c?
 
@@ -153,6 +153,8 @@ Contributions are welcome via pull request.
 GPL-v3.
 
 ## Note
+
+### *: May or may not be 10% all the time, but the boot speed was 18.42 seconds on my machine
 
 ### **init.c** was built and tested the most on **ENux 5.3.3**. If you want to use this init on other systems, be cautious as they haven't been tested yet.
 
