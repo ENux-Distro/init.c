@@ -151,3 +151,11 @@ Contributions are welcome via pull request.
 ## License
 
 GPL-v3.
+
+## Note
+
+### **init.c** was built and tested the most on **ENux 5.3.3**. If you want to use this init on other systems, be cautious as they haven't been tested yet.
+
+### **init.c** will be the default init for **ENux** soon.
+
+### All of the benchmarks, like timing, strata boot speeds and more, have been tested on a 7 strata **ENux** system.
