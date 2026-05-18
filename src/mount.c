@@ -195,19 +195,18 @@ void pivot_root_to(const char *stratum_root)
     if (chdir(stratum_root) < 0)
         panic("chdir to stratum root: %s", strerror(errno));
 
-    /* Extract the "put_old" path relative to new root */
-    /* It is the stratum_root path itself, since after pivot that's where
-     * the old root lands. Example:
-     *   new_root = /bedrock/strata/arch
-     *   put_old  = bedrock/strata/arch   (relative to new_root)
+    /* The shell's pivot() passes the stratum path as put_old:
+     *   pivot_root "." "bedrock/strata/${init_stratum}"
+     *
+     * This resolves to the same path as stratum_root (/bedrock/strata/enux).
+     * After the pivot, the old root is at that path inside the new root.
+     * We then move it to /bedrock/strata/bedrock.
+     *
+     * The kernel requires put_old to exist (as a directory). Since
+     * stratum_root already exists (it's the directory we chdir'd into),
+     * no mkdirp is needed.
      */
     const char *rel_old = stratum_root + 1; /* strip leading '/' */
-
-    /* Ensure the put_old directory exists inside new_root */
-    char put_old_abs[MAX_PATH_LEN];
-    snprintf(put_old_abs, sizeof(put_old_abs), "%s/%s",
-             stratum_root, rel_old);
-    mkdirp(put_old_abs, 0755);
 
     if (do_pivot_root(".", rel_old) < 0)
         panic("pivot_root: %s", strerror(errno));
@@ -216,12 +215,13 @@ void pivot_root_to(const char *stratum_root)
     if (chdir("/") < 0)
         panic("chdir / after pivot: %s", strerror(errno));
 
-    /* Move the old root from its pivot location to /bedrock/strata/bedrock */
-    char old_loc[MAX_PATH_LEN];
-    snprintf(old_loc, sizeof(old_loc),
-             BEDROCK_ROOT "/strata/%s", rel_old);
-
-    if (mount(old_loc, BEDROCK_ROOT "/strata/bedrock",
+    /* Move the old root from its pivot location to /bedrock/strata/bedrock
+     * so Bedrock's tools can find it.
+     *
+     * After pivot, the old root is at stratum_root in the new namespace
+     * (because pivot_root placed it at put_old = "bedrock/strata/<name>"
+     * which resolves to /bedrock/strata/<name> = stratum_root). */
+    if (mount(stratum_root, BEDROCK_ROOT "/strata/bedrock",
               NULL, MS_MOVE, NULL) < 0) {
         notice(COL_YELLOW "warn" COL_RESET
                ": mount --move old root: %s", strerror(errno));
@@ -285,7 +285,9 @@ void preenable_mounts(const char *init_stratum_root)
     mkdirp(BEDROCK_ROOT "/run", 0755);
     mount(br_run, BEDROCK_ROOT "/run", NULL, MS_BIND | MS_REC, NULL);
 
-    /* Re-run ensure_essential_environment after pivot to re-establish
-     * /proc, /dev, /sys from the new root perspective */
-    ensure_essential_environment();
+    /* Force-remount /proc, /dev, /sys after pivot — the old mounts
+     * are in the moved-old-root, not accessible at these paths anymore.
+     * Unlike ensure_essential_environment(), this does not skip if
+     * is_mounted() returns true (which reads stale /proc/mounts). */
+    remount_essential_after_pivot();
 }
