@@ -1,4 +1,4 @@
-# init.c — A faster PID 1 for Bedrock Linux
+# init.c
 
 init.c replaces Bedrock Linux's shell-based init (`/bedrock/strata/bedrock/sbin/init`) with a minimal C + x86_64 ASM static binary. It does the same job: pivot into the chosen stratum, enable all strata, hand off to the real init, but it's 10% faster than Bedrock Linux's init.
 
