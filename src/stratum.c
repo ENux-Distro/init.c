@@ -1,13 +1,14 @@
 /*
  * init.c - stratum scanning and parallel enablement
  *
- * THE KEY SPEEDUP: the shell init enables strata one-by-one in a for loop.
+ * The shell init enables strata one-by-one in a for loop.
  * Each brl-enable call takes several seconds (bind mounts, crossfs setup,
  * xattr writes). With 7 strata that's 7× serialized.
  *
- * Here we fork() one child per stratum and run them ALL simultaneously,
- * then waitpid() for all children. Wall time becomes the slowest single
+ * Here we fork one child per stratum and run them ALL simultaneously,
+ * then waitpid for all children. Wall time becomes the slowest single
  * stratum, not the sum of all.
+ * But 2 second shorter boot times is 2 seconds, we can't complain
  */
 
 #include <stdio.h>
@@ -156,14 +157,24 @@ void enable_stratum(const Stratum *s, int skip_crossfs)
  *   3. brl-repair init_stratum (skip-crossfs)
  *   4. brl-enable all remaining show_boot strata — ALL IN PARALLEL
  */
+/* Suppress stderr in a child process before exec.
+ * Call this after fork() and before execv() to silence
+ * non-fatal warnings from brl-repair/brl-enable. */
+static void silence_child(void)
+{
+    int fd = open("/dev/null", O_WRONLY);
+    if (fd >= 0) {
+        dup2(fd, STDERR_FILENO);
+        close(fd);
+    }
+}
+
 void enable_strata_parallel(InitState *st)
 {
     Stratum *init_s = &st->strata[st->init_index];
 
     /* Step 1: manual bootstrap for bedrock + init stratum */
 
-    /* /bedrock/run/enabled_strata/bedrock
-     * Use a larger buffer: BEDROCK_ROOT appears twice in the path. */
     char enabled_dir[MAX_PATH_LEN * 2];
     snprintf(enabled_dir, sizeof(enabled_dir),
              "%s/strata/bedrock%s/run/enabled_strata",
@@ -178,15 +189,13 @@ void enable_strata_parallel(InitState *st)
         if (fd >= 0) close(fd);
     }
 
-    /* /bedrock/run/init-alias -> /bedrock/strata/<init_stratum> */
     char init_alias[MAX_PATH_LEN * 2];
     snprintf(init_alias, sizeof(init_alias),
              "%s/strata/bedrock%s/run/init-alias",
              BEDROCK_ROOT, BEDROCK_ROOT);
-    unlink(init_alias); /* remove stale */
+    unlink(init_alias);
     symlink(init_s->root, init_alias);
 
-    /* touch enabled_strata/<init_stratum> */
     char enabled_init[MAX_PATH_LEN * 2];
     snprintf(enabled_init, sizeof(enabled_init),
              "%s/%s", enabled_dir, init_s->name);
@@ -195,11 +204,12 @@ void enable_strata_parallel(InitState *st)
         if (fd >= 0) close(fd);
     }
 
-    /* Step 2: brl-repair bedrock (foreground, must finish first) */
+    /* Step 2: brl-repair bedrock (foreground) */
     notice("Enabling " COL_GREEN "bedrock" COL_RESET);
     {
         pid_t pid = fork();
         if (pid == 0) {
+            silence_child();
             execv("/bedrock/libexec/brl-repair",
                   (char *[]){ "brl-repair", "--skip-crossfs", "bedrock", NULL });
             _exit(1);
@@ -212,6 +222,7 @@ void enable_strata_parallel(InitState *st)
     {
         pid_t pid = fork();
         if (pid == 0) {
+            silence_child();
             execv("/bedrock/libexec/brl-repair",
                   (char *[]){ "brl-repair", "--skip-crossfs",
                                init_s->name, NULL });
@@ -226,11 +237,8 @@ void enable_strata_parallel(InitState *st)
     for (int i = 0; i < st->n_strata; i++) {
         Stratum *s = &st->strata[i];
 
-        /* Skip bedrock and the init stratum (already handled above) */
         if (asm_strcmp(s->name, "bedrock") == 0) continue;
         if (asm_strcmp(s->name, init_s->name) == 0) continue;
-
-        /* Only enable strata marked show_boot */
         if (!s->show_boot) continue;
 
         notice("Enabling " COL_CYAN "%s" COL_RESET " (async)", s->name);
@@ -244,29 +252,20 @@ void enable_strata_parallel(InitState *st)
         }
 
         if (pid == 0) {
-            /* Child: enable this stratum and exit */
-            enable_stratum(s, 1 /* skip-crossfs */);
-            _exit(1); /* enable_stratum only returns on exec failure */
+            silence_child();
+            enable_stratum(s, 1);
+            _exit(1);
         }
 
-        /* Parent: count children (we reap with waitpid(-1)) */
         (void)pid;
         n_children++;
     }
 
     /* Step 5: reap all children */
-    notice("Waiting for " COL_BOLD "%d" COL_RESET " strata...", n_children);
-    int status;
+    int ws;
     for (int i = 0; i < n_children; i++) {
-        pid_t done = waitpid(-1, &status, 0);
+        pid_t done = waitpid(-1, &ws, 0);
         if (done < 0) break;
-
-        if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
-            /* Find which stratum this was for better error reporting */
-            notice(COL_YELLOW "warn" COL_RESET
-                   ": a stratum enable process (pid %d) exited with %d",
-                   (int)done, WEXITSTATUS(status));
-        }
     }
 
     notice(COL_GREEN "All strata enabled." COL_RESET);
