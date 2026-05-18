@@ -29,7 +29,12 @@
 
 #include "init.h"
 
-/* ── VT100 ──────────────────────────────────────────────── */
+/* Backup paths are defined in init.h:
+ *   BEDROCK_INIT_BACKUP  = /bedrock/strata/bedrock/sbin/init.sh.bak
+ *   BEDROCK_INIT_BIN_BAK = /bedrock/strata/bedrock/sbin/init.bin.bak
+ */
+
+/* VT100 */
 #define VT_CLEAR        "\033[2J\033[H"
 #define VT_CURSOR_HIDE  "\033[?25l"
 #define VT_CURSOR_SHOW  "\033[?25h"
@@ -56,7 +61,7 @@ static void wf(const char *fmt, ...)
     w(buf);
 }
 
-/* ── Logo ───────────────────────────────────────────────── */
+/* Logo */
 void print_logo(void)
 {
     char release[128] = "Bedrock Linux";
@@ -89,19 +94,49 @@ void print_logo(void)
     w("  |  init.c\n\n");
 }
 
-/* ── Raw terminal helpers ────────────────────────────────── */
+/* Raw terminal helpers */
 
 static struct termios saved_termios;
 static int            raw_active = 0;
+static int            menu_tty_fd = -1;
+
+/* Try to get a usable TTY fd for keyboard input.
+ * At PID 1, STDIN_FILENO is often /dev/null or a console without
+ * proper termios support. Fall back to /dev/console or /dev/tty0. */
+static int open_menu_tty(void)
+{
+    if (isatty(STDIN_FILENO))
+        return STDIN_FILENO;
+
+    static const char *tty_paths[] = {
+        "/dev/console",
+        "/dev/tty0",
+        "/dev/tty1",
+        NULL
+    };
+
+    for (int i = 0; tty_paths[i]; i++) {
+        int fd = open(tty_paths[i], O_RDWR | O_NOCTTY);
+        if (fd >= 0 && isatty(fd))
+            return fd;
+        if (fd >= 0) close(fd);
+    }
+
+    return STDIN_FILENO;
+}
 
 static void enter_raw(void)
 {
-    if (tcgetattr(STDIN_FILENO, &saved_termios) < 0) return;
+    menu_tty_fd = open_menu_tty();
+    if (tcgetattr(menu_tty_fd, &saved_termios) < 0) {
+        menu_tty_fd = STDIN_FILENO;
+        return;
+    }
     struct termios raw = saved_termios;
     raw.c_lflag &= ~(unsigned)(ICANON | ECHO);
     raw.c_cc[VMIN]  = 1;
     raw.c_cc[VTIME] = 0;
-    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    tcsetattr(menu_tty_fd, TCSANOW, &raw);
     w(VT_CURSOR_HIDE);
     raw_active = 1;
 }
@@ -109,61 +144,56 @@ static void enter_raw(void)
 static void leave_raw(void)
 {
     if (!raw_active) return;
-    tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios);
+    tcsetattr(menu_tty_fd, TCSANOW, &saved_termios);
     w(VT_CURSOR_SHOW);
     raw_active = 0;
+    if (menu_tty_fd != STDIN_FILENO) {
+        close(menu_tty_fd);
+        menu_tty_fd = STDIN_FILENO;
+    }
 }
 
-/* ── Fallback menu ───────────────────────────────────────── */
+/* Fallback menu */
 
 /*
  * run_fallback_menu()
  *
  * Shown immediately after the logo, before any stratum scanning.
- * Gives the user a 5-second window to escape to init.sh.bak if
- * something is broken with the C init.
+ * Gives the user a 5-second window to escape to the original Bedrock
+ * Linux init if something is broken with the C init.
  *
- * Option 1 (default): continue with init.c — just returns.
- * Option 2:           exec init.sh.bak — never returns.
+ * Tries raw-mode keyboard input; falls back to cooked line input
+ * if the terminal doesn't support raw mode (common at PID 1 boot).
  *
- * If the backup does not exist, option 2 is shown as unavailable.
+ * Option 1 (default on timeout): Use fallback Bedrock Linux init.
+ * Option 2:                      Continue with init.c.
+ *
+ * Fallback candidates (checked in order):
+ *   BEDROCK_INIT_BACKUP  → init.sh.bak  (shebang backup)
+ *   BEDROCK_INIT_BIN_BAK → init.bin.bak (binary backup)
+ *   /sbin/init           → system fallback
  */
 void run_fallback_menu(char **argv)
 {
-    int backup_ok = (access(BEDROCK_INIT_BACKUP, X_OK) == 0);
+    /* Fallback init is always /sbin/init (the Makefile copies the
+     * original Bedrock shell init there during install) */
+    static const char *fallback_cands[] = {
+        "/sbin/init",
+        NULL
+    };
 
-    /* Render the fallback menu */
-    const int FALLBACK_TIMEOUT = 5;
+    int backup_ok = 0;
+    const char *backup_path = NULL;
 
-    auto void render_fallback(int sel, int secs);
-    void render_fallback(int sel, int secs)
-    {
-        w(VT_CLEAR);
-        print_logo();
-        w(VT_BOLD "  Boot options\n" VT_RESET);
-        if (secs > 0)
-            wf(VT_DIM "  Continuing automatically in %d second%s\n" VT_RESET,
-               secs, secs == 1 ? "" : "s");
-        w("\n");
-
-        /* Option 1 */
-        wf("%s  1.  Continue with " VT_BOLD "init.c" VT_RESET "\n",
-           sel == 0 ? VT_GREEN "▶" VT_RESET : " ");
-
-        /* Option 2 */
-        if (backup_ok) {
-            wf("%s  2.  Use " VT_YELLOW "fallback shell init" VT_RESET
-               VT_DIM " (%s)" VT_RESET "\n",
-               sel == 1 ? VT_GREEN "▶" VT_RESET : " ",
-               BEDROCK_INIT_BACKUP);
-        } else {
-            wf("   2.  " VT_DIM "Fallback unavailable" VT_RESET
-               " (%s not found)\n", BEDROCK_INIT_BACKUP);
+    for (int i = 0; fallback_cands[i]; i++) {
+        if (access(fallback_cands[i], X_OK) == 0) {
+            backup_ok = 1;
+            backup_path = fallback_cands[i];
+            break;
         }
-
-        w("\n");
-        w(VT_DIM "  [↑/↓] navigate   [Enter] select\n" VT_RESET);
     }
+
+    const int FALLBACK_TIMEOUT = 5;
 
     int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
     if (tfd >= 0) {
@@ -174,81 +204,150 @@ void run_fallback_menu(char **argv)
         timerfd_settime(tfd, 0, &its, NULL);
     }
 
-    int sel       = 0;
+    int sel       = 0;              /* default highlight = fallback */
     int remaining = FALLBACK_TIMEOUT;
 
     enter_raw();
-    render_fallback(sel, remaining);
+    int have_raw = raw_active;
 
     int done = 0;
     while (!done) {
+        w(VT_CLEAR);
+        print_logo();
+        w(VT_BOLD "  Boot options\n" VT_RESET);
+        if (remaining > 0 && have_raw)
+            wf(VT_DIM "  Defaulting to fallback in %d second%s\n" VT_RESET,
+               remaining, remaining == 1 ? "" : "s");
+        w("\n");
+
+        if (backup_ok) {
+            wf("%s  1.  Use " VT_YELLOW "fallback Bedrock Linux init" VT_RESET
+               VT_DIM " (%s)" VT_RESET "\n",
+               sel == 0 ? VT_GREEN "▶" VT_RESET : " ",
+               backup_path);
+        } else {
+            wf("   1.  " VT_DIM "Fallback unavailable" VT_RESET
+               " (no backup found)\n");
+        }
+
+        wf("%s  2.  Continue with " VT_BOLD "init.c" VT_RESET "\n",
+           sel == 1 ? VT_GREEN "▶" VT_RESET : " ");
+
+        w("\n");
+        if (have_raw) {
+            w(VT_DIM "  [↑/↓] navigate   [Enter] select   [1/2] quick choice\n" VT_RESET);
+        } else {
+            w(VT_BOLD "  Enter 1 or 2 and press Enter: " VT_RESET);
+        }
+
+        /* Use the TTY fd that enter_raw opened, or STDIN_FILENO */
+        int input_fd = (menu_tty_fd >= 0 && menu_tty_fd != STDIN_FILENO)
+                       ? menu_tty_fd : STDIN_FILENO;
+
         fd_set rfds;
         FD_ZERO(&rfds);
-        FD_SET(STDIN_FILENO, &rfds);
-        int maxfd = STDIN_FILENO;
+        FD_SET(input_fd, &rfds);
+        int maxfd = input_fd;
         if (tfd >= 0) { FD_SET(tfd, &rfds); if (tfd > maxfd) maxfd = tfd; }
 
-        int r = select(maxfd + 1, &rfds, NULL, NULL, NULL);
+        /* Always use a timeout so we don't hang forever */
+        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+        int r = select(maxfd + 1, &rfds, NULL, NULL,
+                       (tfd >= 0 || have_raw) ? NULL : &tv);
         if (r < 0 && errno == EINTR) continue;
 
-        /* Timer tick */
         if (tfd >= 0 && FD_ISSET(tfd, &rfds)) {
             uint64_t exp;
             (void)read(tfd, &exp, sizeof(exp));
             remaining -= (int)exp;
             if (remaining <= 0) {
-                done = 1; /* auto-select option 1 */
+                sel = backup_ok ? 0 : 1;
+                done = 1;
                 break;
             }
-            render_fallback(sel, remaining);
         }
 
-        /* Keyboard */
-        if (FD_ISSET(STDIN_FILENO, &rfds)) {
-            unsigned char ch;
-            if (read(STDIN_FILENO, &ch, 1) != 1) break;
-
-            if (ch == 0x1b) {
-                /* Arrow key escape sequence */
-                struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
-                fd_set peek; FD_ZERO(&peek); FD_SET(STDIN_FILENO, &peek);
-                if (select(STDIN_FILENO+1, &peek, NULL, NULL, &tv) > 0) {
-                    unsigned char seq[2];
-                    (void)read(STDIN_FILENO, seq, 2);
-                    if (seq[0] == '[') {
-                        if (seq[1] == 'A' && sel > 0) sel--;
-                        else if (seq[1] == 'B' && sel < 1) sel++;
-                    }
-                }
-                remaining = FALLBACK_TIMEOUT;
-            } else if (ch == '1') {
-                sel = 0; done = 1;
-            } else if (ch == '2' && backup_ok) {
-                sel = 1; done = 1;
-            } else if (ch == '\n' || ch == '\r') {
+        /* Cooked mode fallback: no timerfd, no raw — poll every 1s */
+        if (!have_raw && tfd < 0 && r == 0) {
+            remaining--;
+            if (remaining <= 0) {
+                sel = backup_ok ? 0 : 1;
                 done = 1;
+                break;
             }
+        }
 
-            if (!done) render_fallback(sel, remaining);
+        if (FD_ISSET(input_fd, &rfds)) {
+            if (have_raw) {
+                /* Raw mode: single char reads */
+                unsigned char ch;
+                if (read(input_fd, &ch, 1) != 1) break;
+
+                if (ch == 0x1b) {
+                    struct timeval tv2 = { .tv_sec = 0, .tv_usec = 50000 };
+                    fd_set peek; FD_ZERO(&peek); FD_SET(input_fd, &peek);
+                    if (select(input_fd + 1, &peek, NULL, NULL, &tv2) > 0) {
+                        unsigned char seq[2];
+                        (void)read(input_fd, seq, 2);
+                        if (seq[0] == '[') {
+                            if (seq[1] == 'A' && sel > 0) sel--;
+                            else if (seq[1] == 'B' && sel < 1) sel++;
+                        }
+                    }
+                    remaining = FALLBACK_TIMEOUT;
+                } else if (ch == '1' && backup_ok) {
+                    sel = 0; done = 1;
+                } else if (ch == '2') {
+                    sel = 1; done = 1;
+                } else if (ch == '\n' || ch == '\r') {
+                    done = 1;
+                } else if ((ch == 'f' || ch == 'F') && backup_ok) {
+                    sel = 0; done = 1;
+                } else if (ch == 'c' || ch == 'C') {
+                    sel = 1; done = 1;
+                }
+            } else {
+                /* Cooked mode: read a line */
+                char line[16];
+                ssize_t n = read(input_fd, line, sizeof(line) - 1);
+                if (n <= 0) { /* maybe EOF, poll again */ continue; }
+                line[n] = '\0';
+                if (line[0] == '1' && backup_ok) {
+                    sel = 0; done = 1;
+                } else if (line[0] == '2') {
+                    sel = 1; done = 1;
+                }
+            }
         }
     }
 
     leave_raw();
     if (tfd >= 0) close(tfd);
 
-    if (sel == 1 && backup_ok) {
-        /* User chose the fallback — exec the shell init, never return */
-        notice("Falling back to " BEDROCK_INIT_BACKUP);
-        execv(BEDROCK_INIT_BACKUP, argv);
+    if (sel == 0 && backup_ok) {
+        notice("Falling back to %s", backup_path);
+        struct stat st;
+        if (stat(backup_path, &st) < 0)
+            panic("Fallback init %s not found: %s", backup_path, strerror(errno));
+        if (!(st.st_mode & S_IXUSR))
+            panic("Fallback init %s is not executable", backup_path);
+        if (S_ISLNK(st.st_mode)) {
+            char target[256];
+            ssize_t len = readlink(backup_path, target, sizeof(target) - 1);
+            if (len >= 0) target[len] = '\0';
+            notice("  (%s is a symlink to %s)", backup_path, len > 0 ? target : "?");
+        }
+        char *fb_argv[] = { (char *)backup_path, NULL };
+        execv(backup_path, fb_argv);
         panic("exec of fallback init failed: %s", strerror(errno));
     }
 
-    /* sel == 0: continue with init.c — just return */
+    /* sel == 1: continue with init.c */
     w(VT_CLEAR);
     print_logo();
 }
 
-/* ── Init path resolution ────────────────────────────────── */
+/* Init path resolution */
 
 /*
  * resolve_init_path()
@@ -306,7 +405,7 @@ static int resolve_init_path(const char *stratum_root,
     return ret;
 }
 
-/* ── Init option list ────────────────────────────────────── */
+/* Init option list */
 
 typedef struct {
     char stratum[MAX_NAME_LEN];
@@ -338,6 +437,7 @@ static void populate_options(InitState *st)
 
         if (!s->show_init) continue;
         if (asm_strcmp(s->name, "bedrock") == 0) continue;
+        if (asm_strcmp(s->name, "hijacked") == 0) continue;
 
         for (int j = 0; known_init_paths[j]; j++) {
             const char *cmd = known_init_paths[j];
@@ -397,7 +497,7 @@ done_scanning:;
     }
 }
 
-/* ── Init selection menu rendering ──────────────────────── */
+/* Init selection menu rendering */
 
 static void render_menu(int highlight, int remaining_secs)
 {
@@ -427,8 +527,6 @@ static void render_menu(int highlight, int remaining_secs)
     w("\n");
     w(VT_DIM "  [↑/↓] navigate   [Enter] select   [0-9] jump\n" VT_RESET);
 }
-
-/* ── run_menu() ──────────────────────────────────────────── */
 
 /*
  * run_menu()
