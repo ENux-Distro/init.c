@@ -51,7 +51,7 @@ main()
 | gcc   | C compilation     |
 | nasm  | Assembly          |
 | ld    | Linking (binutils)|
-| attr  | Handles fs objects |
+| **static** attr  | Handles fs objects |
 
 All must target **x86_64 Linux**. The binary is statically linked and has no runtime library dependencies.
 
@@ -159,3 +159,9 @@ GPL-v3.
 ### **init.c** will be the default init for **ENux** soon.
 
 ### All of the benchmarks, like timing, strata boot speeds and more, have been tested on a 7 strata **ENux** system.
+
+### The system to test **init.c** consists of:
+
+- i5 12400f (12 processing units)
+- 32 GB DDR5 6000 MHz CL30
+- Gen 4 NVME (with read/write speeds of around 5000/3500 MBs)
