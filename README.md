@@ -51,6 +51,7 @@ main()
 | gcc   | C compilation     |
 | nasm  | Assembly          |
 | ld    | Linking (binutils)|
+| attr  | Handles fs objects |
 
 All must target **x86_64 Linux**. The binary is statically linked and has no runtime library dependencies.
 
