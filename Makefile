@@ -101,7 +101,7 @@ LDFLAGS := \
 # Libraries needed (static versions)
 # libattr: for getxattr/setxattr
 # libc:    implicit with -static
-LIBS := -lattr
+LIBS := -L/usr/local/lib -Wl,-rpath,/usr/local/lib
 
 # Def target
 .PHONY: all
@@ -139,14 +139,62 @@ $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
 # Install
-INSTALL_PATH ?= /bedrock/libexec/init
+INSTALL_PATH ?= /bedrock/strata/bedrock/sbin/init
+
+# Path that the fallback menu execs — must always point to the real
+# Bedrock shell init, never to our custom binary.
+FALLBACK_INIT ?= /sbin/init
 
 .PHONY: install
 install: $(BUILDDIR)/init
+	@echo ""
+	@echo "  === init.c install ==="
+	@echo "  Target: $(INSTALL_PATH)"
+	@echo "  Fallback: $(FALLBACK_INIT)"
+	@echo ""
+	@if [ -f "$(INSTALL_PATH)" ]; then \
+		if head -c 2 "$(INSTALL_PATH)" 2>/dev/null | grep -q '^#!'; then \
+			cp "$(INSTALL_PATH)" "$(INSTALL_PATH).sh.bak"; \
+			echo "  [1/3] Existing shell init → $(INSTALL_PATH).sh.bak"; \
+		else \
+			cp "$(INSTALL_PATH)" "$(INSTALL_PATH).bin.bak"; \
+			echo "  [1/3] Existing binary init → $(INSTALL_PATH).bin.bak"; \
+		fi; \
+	fi
+	@if [ -f "$(INSTALL_PATH).sh.bak" ]; then \
+		echo "  [2/3] Copying backup to $(FALLBACK_INIT)"; \
+		rm -f "$(FALLBACK_INIT)"; \
+		cp "$(INSTALL_PATH).sh.bak" "$(FALLBACK_INIT)"; \
+		chmod 0755 "$(FALLBACK_INIT)"; \
+	elif [ -f "$(INSTALL_PATH).bin.bak" ]; then \
+		echo "  [2/3] Copying backup to $(FALLBACK_INIT)"; \
+		rm -f "$(FALLBACK_INIT)"; \
+		cp "$(INSTALL_PATH).bin.bak" "$(FALLBACK_INIT)"; \
+		chmod 0755 "$(FALLBACK_INIT)"; \
+	else \
+		echo "  [2/3] No backup to copy — run 'make install-fallback' for a fresh download"; \
+	fi
+	@echo "  [3/3] Installing custom init"
 	$(INSTALL) -D -m 0755 $< $(INSTALL_PATH)
 	@echo "  Installed to $(INSTALL_PATH)"
-	ln -svf /bedrock/libexec/init /sbin/init
-	@echo " /sbin/init is now symlinked to /bedrock/libexec/init"
+	@echo ""
+
+.PHONY: install-fallback
+install-fallback:
+	@echo ""
+	@echo "  === Fallback init download ==="
+	@echo "  Downloads official Bedrock Linux init to $(INSTALL_PATH).sh.bak"
+	@echo "  and copies it to $(FALLBACK_INIT)"
+	@echo ""
+	wget -O "$(INSTALL_PATH).sh.bak" \
+		https://raw.githubusercontent.com/bedrocklinux/bedrocklinux-userland/refs/heads/master/src/init/init
+	chmod 0755 "$(INSTALL_PATH).sh.bak"
+	cp "$(INSTALL_PATH).sh.bak" "$(FALLBACK_INIT)"
+	chmod 0755 "$(FALLBACK_INIT)"
+	@echo ""
+	@echo "  Saved: $(INSTALL_PATH).sh.bak"
+	@echo "  Saved: $(FALLBACK_INIT)"
+	@echo ""
 
 # Test
 # These run on the build host (not in a Bedrock environment).
