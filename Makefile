@@ -125,7 +125,7 @@ $(BUILDDIR):
 # script) or init.bin.bak (binary) so the fallback/NOT_PID1 paths in the
 # C code can find it.
 # See INSTALL.md for activation (kernel init= parameter) and rollback.
-INSTALL_PATH      ?= /bedrock/strata/bedrock/sbin/enux-init
+INSTALL_PATH      ?= /bedrock/strata/bedrock/sbin/init
 ORIGINAL_INIT_PATH = /bedrock/strata/bedrock/sbin/init
 
 # Create a .sh.bak or .bin.bak backup of the original init, depending
