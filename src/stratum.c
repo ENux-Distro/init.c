@@ -21,6 +21,7 @@
 
 #include "init.h"
 #include "stratum.h"
+#include "brl.h"
 
 /* xattr helpers (user.bedrock.* namespace) */
 
@@ -297,13 +298,16 @@ void enable_strata_parallel(InitState *st)
 
     /* brl-repair bedrock, then the init stratum — sequential, output
      * visible, like the shell. */
+    unsigned long t = timing_now_ms();
     notice("Enabling " COL_GREEN "bedrock" COL_RESET);
     int rc = run_cmd((char *[]){
         BEDROCK_ROOT "/libexec/brl-repair", "--skip-crossfs",
         "bedrock", NULL }, 0);
     if (rc != 0)
         warn("brl-repair bedrock exited %d", rc);
+    timing_mark("brl-repair bedrock", t);
 
+    t = timing_now_ms();
     notice("Enabling " COL_GREEN "%s" COL_RESET " (init stratum)",
            init_s->name);
     rc = run_cmd((char *[]){
@@ -311,6 +315,14 @@ void enable_strata_parallel(InitState *st)
         init_s->name, NULL }, 0);
     if (rc != 0)
         warn("brl-repair %s exited %d", init_s->name, rc);
+    timing_mark("brl-repair init stratum", t);
+
+    unsigned long t_par = timing_now_ms();
+
+    /* With the native path, set up the bedrock-side shared/bind propagation
+     * once here so the parallel children never race on the /bedrock tree. */
+    if (native_brl_enabled)
+        native_prepare_shared_mounts();
 
     /* brl-enable every remaining show_boot stratum, all in parallel. */
     pid_t child_pid[MAX_STRATA];
@@ -345,6 +357,12 @@ void enable_strata_parallel(InitState *st)
                     _exit(127);
                 close(lfd);
             }
+            /* Native path: handle it in C; fall back to the shell
+             * brl-enable only for strata it declines (e.g. non-native
+             * arch needing QEMU). */
+            if (native_brl_enabled &&
+                native_enable_stratum(s->name, s->root) == 0)
+                _exit(0);
             execv(BEDROCK_ROOT "/libexec/brl-enable",
                   (char *[]){ BEDROCK_ROOT "/libexec/brl-enable",
                               "--skip-crossfs", s->name, NULL });
@@ -387,6 +405,17 @@ void enable_strata_parallel(InitState *st)
                      name, child_log[c]);
             break;
         }
+    }
+
+    timing_mark("brl-enable parallel batch (wall clock)", t_par);
+
+    /* The two O(strata^2) helpers, hoisted out of the per-stratum loop:
+     * run once across all strata instead of once per shell brl-enable. */
+    if (native_brl_enabled) {
+        unsigned long t_enf = timing_now_ms();
+        enforce_shells_all(st);
+        enforce_id_ranges_all(st);
+        timing_mark("enforce_shells + enforce_id_ranges (once)", t_enf);
     }
 
     notice(COL_GREEN "All strata enabled" COL_RESET);

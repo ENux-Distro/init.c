@@ -94,6 +94,14 @@ void notice(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void warn(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void step(int n, int total, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
+
+/* Boot timing instrumentation.  Disabled unless `enux_timing` is present
+ * on the kernel command line, so production boots stay quiet.  Throwaway
+ * scaffolding for the brl-in-C port decision; remove once measured. */
+extern int    timing_enabled;
+void          timing_init(void);
+unsigned long timing_now_ms(void);
+void          timing_mark(const char *label, unsigned long start_ms);
 int  run_cmd(char *const argv[], int silent);
 int  is_self(const char *path);
 /* Concatenate NUL-terminated strings into out; the list ends with NULL.

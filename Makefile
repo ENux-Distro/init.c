@@ -35,6 +35,7 @@ C_SRCS := \
 	$(SRCDIR)/menu.c         \
 	$(SRCDIR)/hijack.c       \
 	$(SRCDIR)/bedrock_conf.c \
+	$(SRCDIR)/brl.c          \
 	$(SRCDIR)/util.c
 
 ASM_SRCS := \

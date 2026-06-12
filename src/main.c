@@ -37,6 +37,7 @@
 #include "init.h"
 #include "bedrock_conf.h"
 #include "stratum.h"
+#include "brl.h"
 
 /* Parse bedrock_init=stratum:cmd from /proc/cmdline.
  * Returns 1 and fills buf if found, 0 otherwise. */
@@ -161,7 +162,12 @@ int main(int argc, char **argv)
     if (setenv("PATH", DEFAULT_PATH, 1) < 0)
         warn("setenv PATH: %s", strerror(errno));
 
+    timing_init();
+    native_brl_init();
+
+    unsigned long t = timing_now_ms();
     ensure_essential_environment();
+    timing_mark("ensure_essential_environment", t);
     setup_term();
     print_logo();
 
@@ -218,25 +224,40 @@ int main(int argc, char **argv)
 
     Stratum *init_s = &st.strata[st.init_index];
 
+    unsigned long t_boot = timing_now_ms();
+
     step(1, 6, "Mounting " COL_CYAN "fstab" COL_RESET);
+    t = timing_now_ms();
     mount_fstab();
+    timing_mark("mount_fstab", t);
 
     step(2, 6, "Pivoting to " COL_GREEN "%s" COL_RESET, init_s->name);
+    t = timing_now_ms();
     pivot_root_to(init_s->root);
+    timing_mark("pivot_root", t);
 
     step(3, 6, "Preparing to enable");
+    t = timing_now_ms();
     preenable_mounts();
+    timing_mark("preenable_mounts", t);
 
     step(4, 6, "Enabling " COL_YELLOW "strata" COL_RESET);
+    t = timing_now_ms();
     enable_strata_parallel(&st);
+    timing_mark("enable_strata_parallel (total)", t);
 
     step(5, 6, "Applying configuration");
+    t = timing_now_ms();
     {
-        int rc = run_cmd((char *[]){
-            BEDROCK_ROOT "/libexec/brl-apply", "--skip-repair", NULL }, 0);
+        int rc = native_brl_enabled
+            ? native_apply_run(&st)
+            : run_cmd((char *[]){
+                  BEDROCK_ROOT "/libexec/brl-apply", "--skip-repair", NULL }, 0);
         if (rc != 0)
             warn("brl-apply exited %d", rc);
     }
+    timing_mark("brl-apply", t);
+    timing_mark("TOTAL fstab->apply (the brl-attributable window)", t_boot);
 
     step(6, 6, "Handing control to " COL_GREEN "%s" COL_RESET
          ":" COL_CYAN "%s" COL_RESET, init_s->name, st.init_cmd);

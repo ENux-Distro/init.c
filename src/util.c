@@ -12,10 +12,55 @@
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 
 #include "init.h"
+
+/*
+ * Boot timing instrumentation
+ *
+ * Off by default; enabled by adding `enux_timing` to the kernel command
+ * line.  CLOCK_MONOTONIC, millisecond resolution.  timing_mark() prints
+ * elapsed-since-start so each phase is timed independently of the
+ * interactive menu wait.
+ */
+int timing_enabled = 0;
+
+void timing_init(void)
+{
+    int fd = open("/proc/cmdline", O_RDONLY);
+    if (fd < 0)
+        return;
+    char buf[4096];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return;
+    buf[n] = '\0';
+    if (strstr(buf, "enux_timing"))
+        timing_enabled = 1;
+}
+
+unsigned long timing_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long)ts.tv_sec * 1000UL +
+           (unsigned long)ts.tv_nsec / 1000000UL;
+}
+
+void timing_mark(const char *label, unsigned long start_ms)
+{
+    if (!timing_enabled)
+        return;
+    char line[256];
+    snprintf(line, sizeof(line),
+             COL_DIM "  [+%5lu ms] %s" COL_RESET "\n",
+             timing_now_ms() - start_ms, label);
+    asm_write_str(STDOUT_FILENO, line);
+}
 
 /*
  * panic()

@@ -216,3 +216,51 @@ int cfg_values(const char *section, const char *key,
     cfg_foreach(section, key, values_cb, &u);
     return u.count;
 }
+
+/* cfg_keys — list every key in a section.  Mirrors cfg_foreach's line walk
+ * but yields the key rather than filtering on it. */
+int cfg_keys(const char *section, char out[][MAX_PATH_LEN], int max)
+{
+    if (cfg_load() < 0)
+        return 0;
+
+    char line[1024];
+    char cur_section[MAX_NAME_LEN] = "";
+    int  count = 0;
+
+    size_t pos = 0;
+    while (pos < cfg_len && count < max) {
+        size_t end = pos;
+        while (end < cfg_len && cfg_buf[end] != '\n')
+            end++;
+        size_t linelen = end - pos;
+        if (linelen >= sizeof(line))
+            linelen = sizeof(line) - 1;
+        memcpy(line, cfg_buf + pos, linelen);
+        line[linelen] = '\0';
+        pos = end + 1;
+
+        char *p = trim(line);
+        if (*p == '\0')
+            continue;
+
+        if (*p == '[') {
+            char *close = strchr(p + 1, ']');
+            if (close) {
+                *close = '\0';
+                snprintf(cur_section, sizeof(cur_section), "%s", trim(p + 1));
+            }
+            continue;
+        }
+
+        if (asm_strcmp(cur_section, section) != 0)
+            continue;
+
+        char *eq = strchr(p, '=');
+        if (!eq)
+            continue;
+        *eq = '\0';
+        snprintf(out[count++], MAX_PATH_LEN, "%s", trim(p));
+    }
+    return count;
+}

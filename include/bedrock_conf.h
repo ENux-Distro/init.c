@@ -25,4 +25,8 @@ int cfg_value(const char *section, const char *key, char *out, size_t outsz);
 int cfg_values(const char *section, const char *key,
                char out[][MAX_PATH_LEN], int max);
 
+/* List every key in `[section]`, in file order, not deduplicated — matches
+ * the shell cfg_keys.  Fills up to `max` entries; returns the count. */
+int cfg_keys(const char *section, char out[][MAX_PATH_LEN], int max);
+
 #endif /* ENUX_BEDROCK_CONF_H */
