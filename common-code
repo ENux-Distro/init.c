@@ -1,0 +1,1905 @@
+#!/bedrock/libexec/busybox sh
+#
+# Shared Bedrock Linux shell functions
+#
+#      This program is free software; you can redistribute it and/or
+#      modify it under the terms of the GNU General Public License
+#      version 2 as published by the Free Software Foundation.
+#
+# Copyright (c) 2016-2020 Daniel Thau <danthau@bedrocklinux.org>
+
+# Print the Bedrock Linux ASCII logo.
+#
+# ${1} can be provided to indicate a tag line.  This should typically be the
+# contents of /bedrock/etc/bedrock-release such that this function should be
+# called with:
+#     print_logo "$(cat /bedrock/etc/bedrock-release)"
+# This path is not hard-coded so that this function can be called in a
+# non-Bedrock environment, such as with the installer.
+print_logo() {
+	printf "${color_logo}"
+	# Shellcheck indicates an escaped backslash - `\\` - is preferred over
+	# the implicit situation below.  Typically this is agreeable as it
+	# minimizes confusion over whether a given backslash is a literal or
+	# escaping something.  However, in this situation it ruins the pretty
+	# ASCII alignment.
+	#
+	# shellcheck disable=SC1117
+	cat <<EOF
+__          __             __      
+\ \_________\ \____________\ \___  
+ \  _ \  _\ _  \  _\ __ \ __\   /  
+  \___/\__/\__/ \_\ \___/\__/\_\_\ 
+EOF
+	if [ -n "${1:-}" ]; then
+		printf "%35s\\n" "${1}"
+	fi
+	printf "${color_norm}\\n"
+}
+
+# Compare Bedrock Linux versions.  Returns success if the first argument is
+# newer than the second.  Returns failure if the two parameters are equal or if
+# the second is newer than the first.
+#
+# To compare for equality or inequality, simply do a string comparison.
+#
+# For example
+#     ver_cmp_first_newer() "0.7.0beta5" "0.7.0beta4"
+# returns success while
+#     ver_cmp_first_newer() "0.7.0beta5" "0.7.0"
+# returns failure.
+ver_cmp_first_newer() {
+	# 0.7.0beta1
+	# ^ ^ ^^  ^^
+	# | | ||  |\ tag_ver
+	# | | |\--+- tag
+	# | | \----- patch
+	# | \------- minor
+	# \--------- major
+
+	left_major="$(echo "${1}" | awk -F'[^0-9][^0-9]*' '{print$1}')"
+	left_minor="$(echo "${1}" | awk -F'[^0-9][^0-9]*' '{print$2}')"
+	left_patch="$(echo "${1}" | awk -F'[^0-9][^0-9]*' '{print$3}')"
+	left_tag="$(echo "${1}" | awk -F'[0-9][0-9]*' '{print$4}')"
+	left_tag_ver="$(echo "${1}" | awk -F'[^0-9][^0-9]*' '{print$4}')"
+
+	right_major="$(echo "${2}" | awk -F'[^0-9][^0-9]*' '{print$1}')"
+	right_minor="$(echo "${2}" | awk -F'[^0-9][^0-9]*' '{print$2}')"
+	right_patch="$(echo "${2}" | awk -F'[^0-9][^0-9]*' '{print$3}')"
+	right_tag="$(echo "${2}" | awk -F'[0-9][0-9]*' '{print$4}')"
+	right_tag_ver="$(echo "${2}" | awk -F'[^0-9][^0-9]*' '{print$4}')"
+
+	[ "${left_major}" -gt "${right_major}" ] && return 0
+	[ "${left_major}" -lt "${right_major}" ] && return 1
+	[ "${left_minor}" -gt "${right_minor}" ] && return 0
+	[ "${left_minor}" -lt "${right_minor}" ] && return 1
+	[ "${left_patch}" -gt "${right_patch}" ] && return 0
+	[ "${left_patch}" -lt "${right_patch}" ] && return 1
+	[ -z "${left_tag}" ] && [ -n "${right_tag}" ] && return 0
+	[ -n "${left_tag}" ] && [ -z "${right_tag}" ] && return 1
+	[ -z "${left_tag}" ] && [ -z "${right_tag}" ] && return 1
+	[ "${left_tag}" \> "${right_tag}" ] && return 0
+	[ "${left_tag}" \< "${right_tag}" ] && return 1
+	[ "${left_tag_ver}" -gt "${right_tag_ver}" ] && return 0
+	[ "${left_tag_ver}" -lt "${right_tag_ver}" ] && return 1
+	return 1
+}
+
+# Call to return successfully.
+exit_success() {
+	trap '' EXIT
+	exit 0
+}
+
+# Abort the given program.  Prints parameters as an error message.
+#
+# This should be called whenever a situation arises which cannot be handled.
+#
+# This file sets various shell settings to exit on unexpected errors and traps
+# EXIT to call abort.  To exit without an error, call `exit_success`.
+abort() {
+	trap '' EXIT
+	printf "${color_alert}ERROR: %s\\n${color_norm}" "${@}" >&2
+	exit 1
+}
+
+# Clean up "${target_dir}" and prints an error message.
+#
+# `brl fetch`'s various back-ends trap EXIT with this to clean up on an
+# unexpected error.
+fetch_abort() {
+	set +x # if someone turned `set -x` on in a per-distro fetch script, it's probably no longer needed at this point
+	trap '' EXIT
+	printf "${color_alert}ERROR: %s\\n${color_norm}" "${@}" >&2
+	printf "${color_alert}This is commonly due to distro mirror layout changes breaking \`brl fetch\`.  Possible solutions:\\n${color_norm}" >&2
+	printf "${color_alert}- If you did not, consider manually providing a mirror with --mirror\\n${color_norm}" >&2
+	printf "${color_alert}- Check for a Bedrock Linux update with \`brl update\`\\n${color_norm}" >&2
+	printf "${color_alert}- Check for a Bedrock Linux beta which may contain a fix\\n${color_norm}" >&2
+	printf "${color_alert}- Try \`brl import\` which does not rely on mirror layout\\n${color_norm}" >&2
+	printf "${color_alert}\\n${color_norm}" >&2
+
+	if cfg_values "miscellaneous" "debug" | grep -q "brl-fetch"; then
+		printf "${color_alert}Skipping cleaning up ${target_dir:-} due to bedrock.conf debug setting.${color_norm}\n"
+	elif [ -n "${target_dir:-}" ] && [ -d "${target_dir:-}" ]; then
+		if ! less_lethal_rm_rf "${target_dir:-}"; then
+			printf "${color_alert}ERROR cleaning up ${target_dir:-}
+You will have to clean up yourself.
+!!! BE CAREFUL !!!
+\`rm\` around mount points may result in accidentally deleting something you wish to keep.
+Consider rebooting to remove mount points and kill errant processes first.${color_norm}
+"
+		fi
+	fi
+
+	exit 1
+}
+
+# Define print_help() then call with:
+#     handle_help "${@:-}"
+# at the beginning of brl subcommands to get help handling out of the way
+# early.
+handle_help() {
+	if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+		print_help
+		exit_success
+	fi
+}
+
+# Print a message indicating some step without a corresponding step count was
+# completed.
+notice() {
+	printf "${color_misc}* ${color_norm}${*}\\n"
+}
+
+# Initialize step counter.
+#
+# This is used when performing some action with multiple steps to give the user
+# a sense of progress.  Call this before any calls to step(), setting the total
+# expected step count.  For example:
+#     step_init 3
+#     step "Completed step 1"
+#     step "Completed step 2"
+#     step "Completed step 3"
+step_init() {
+	step_current=0
+	step_total="${1}"
+}
+
+# Indicate a given step has been completed.
+#
+# See `step_init()` above.
+step() {
+	step_current=$((step_current + 1))
+
+	step_count=$(printf "%d" "${step_total}" | wc -c)
+	percent=$((step_current * 100 / step_total))
+	printf "${color_misc}[%${step_count}d/%d (%3d%%)]${color_norm} ${*:-}${color_norm}\\n" \
+		"${step_current}" \
+		"${step_total}" \
+		"${percent}"
+}
+
+get_width() {
+	width=$( (stty size 2>/dev/null || echo "x 40") | cut -d' ' -f2)
+	if [ "${width}" -gt 80 ]; then
+		width=80
+	fi
+}
+
+progress_bar() {
+	get_width
+	awk -v"total=${1}" -v"width=${width}" '
+		BEGIN {
+			width -= 8
+			bar = ""
+			for (i = 0; i < width; i++) {
+				bar = bar " "
+			}
+			printf "\r[%s] %3d%%", bar, NR * 100 / total
+		}
+		{
+			bar = ""
+			for (i = 0; i < width; i++) {
+				if ((NR / total) >= (i / width)) {
+					bar = bar "\\"
+				} else {
+					bar = bar " "
+				}
+			}
+			printf "\r[%s] %3d%%", bar, NR * 100 / total
+		}
+		END {
+			bar = ""
+			for (i = 0; i < width; i++) {
+				bar = bar "\\"
+			}
+			printf "\r[%s] 100%%\n", bar
+		}
+	' -
+}
+
+progress_unknown() {
+	get_width
+	awk -v"width=${width}" '
+		BEGIN {
+			width -= 8
+			s[0] = "-"; s[1] = "\\"; s[2] = "|"; s[3] = "/"
+			printf "\r["
+			for (i = 0; i < width; i++) {
+				bar = bar " "
+			}
+			printf "\r[%s]  ??%%", bar
+		}
+		{
+			bar = ""
+			for (i = 0; i < width; i++) {
+				if (!(i % 3)) {
+					bar = bar "" s[(NR + i) % 4]
+				} else {
+					bar = bar " "
+				}
+			}
+			printf "\r[%s]  ??%%", bar
+		}
+		END {
+			bar = ""
+			for (i = 0; i < width; i++) {
+				bar = bar "\\"
+			}
+			printf "\r[%s] 100%%\n", bar
+		}
+	' -
+}
+
+# Abort if parameter is not a legal stratum name.
+ensure_legal_stratum_name() {
+	name="${1}"
+	if echo "${name}" | grep -q '[[:space:]/\\:=$"'"'"']'; then
+		abort "\"${name}\" contains disallowed character: whitespace, forward slash, back slash, colon, equals sign, dollar sign, single quote, and/or double quote."
+	elif echo "x${name}" | grep "^x-"; then
+		abort "\"${name}\" starts with a \"-\" which is disallowed."
+	elif [ "${name}" = "bedrock" ] || [ "${name}" = "init" ]; then
+		abort "\"${name}\" is one of the reserved strata names: bedrock, init."
+	fi
+}
+
+strip_illegal_stratum_name_characters() {
+	cat | sed -e 's![[:space:]/\\:=$"'"'"']!!g' -e "s!^-!!"
+}
+
+# Call with:
+#     min_args "${#}" "<minimum-expected-arg-count>"
+# at the beginning of brl subcommands to error early if insufficient parameters
+# are provided.
+min_args() {
+	arg_cnt="${1}"
+	tgt_cnt="${2}"
+	if [ "${arg_cnt}" -lt "${tgt_cnt}" ]; then
+		abort "Insufficient arguments, see \`--help\`."
+	fi
+}
+
+# Aborts if not running as root.
+require_root() {
+	if ! [ "$(id -u)" -eq "0" ]; then
+		abort "Operation requires root."
+	fi
+}
+
+# Bedrock lock subsystem management.
+#
+# Locks specified directory.  If no directory is specified, defaults to
+# /bedrock/var/.
+#
+# This is used to avoid race conditions between various Bedrock subsystems.
+# For example, it would be unwise to allow multiple simultaneous attempts to
+# enable the same stratum.
+#
+# By default will this will block until the lock is acquired.  Do not use this
+# on long-running commands.  If --nonblock is provided, will return non-zero if
+# the lock is already in use rather than block.
+#
+# The lock is automatically dropped when the shell script (and any child
+# processes) ends, and thus an explicit unlock is typically not needed.  See
+# drop_lock() for cases where an explicit unlock is needed.
+#
+# Only one lock may be held at a time.
+lock() {
+	require_root
+
+	if [ "${1:-}" = "--nonblock" ]; then
+		nonblock="${1}"
+		shift
+	fi
+	dir="${1:-/bedrock/var/}"
+
+	# The list of directories which can be locked is white-listed to help
+	# catch typos/bugs.  Abort if not in the list.
+	if echo "${dir}" | grep -q "^\\/bedrock\\/var\\/\\?$"; then
+		# system lock
+		true
+	elif echo "${dir}" | grep -q "^\\/bedrock\\/var\\/cache\\/[^/]*/\\?$"; then
+		# cache lock
+		true
+	else
+		abort "Attempted to lock non-white-listed item \"${1}\""
+	fi
+
+	# Update timestamps on lock to delay removal by cache cleaning logic.
+	mkdir -p "${dir}"
+	touch "${dir}"
+	touch "${dir}/lock"
+	exec 9>"${dir}/lock"
+	# Purposefully not quoting so an empty string is ignored rather than
+	# treated as a parameter.
+	# shellcheck disable=SC2086
+	flock ${nonblock:-} -x 9
+}
+
+# Drop lock on Bedrock subsystem management.
+#
+# This can be used in two ways:
+#
+# 1. If a shell script needs to unlock before it finishes.  This is primarily
+# intended for long-running shell scripts to strategically lock only required
+# sections rather than lock for an unacceptably large period of time.  Call
+# with:
+#     drop_lock
+#
+# 2. If the shell script launches a process which will outlive it (and
+# consequently the intended lock period), as child processes inherit locks.  To
+# drop the lock for just the child process and not the parent script, call with:
+#     ( drop_lock ; cmd )
+drop_lock() {
+	exec 9>&-
+}
+
+# Various Bedrock subsystems - most notably brl-fetch - create files which are
+# cached for use in the future.  Clean up any that have not been utilized in a
+# configured amount of time.
+clear_old_cache() {
+	require_root
+
+	life="$(cfg_value "miscellaneous" "cache-life")"
+	life="${life:-90}"
+	one_day="$((24 * 60 * 60))"
+	age_in_sec="$((life * one_day))"
+	current_time="$(date +%s)"
+	if [ "${life}" -ge 0 ]; then
+		export del_time="$((current_time - age_in_sec))"
+	else
+		# negative value indicates cache never times out.  Set deletion
+		# time to some far future time which will not be hit while the
+		# logic below is running.
+		export del_time="$((current_time + one_day))"
+	fi
+
+	# If there are no cache items, abort early
+	if ! echo /bedrock/var/cache/* >/dev/null 2>&1; then
+		return
+	fi
+
+	for dir in /bedrock/var/cache/*; do
+		# Lock directory so nothing uses it mid-removal.  Skip it if it
+		# is currently in use.
+		if ! lock --nonblock "${dir}"; then
+			continue
+		fi
+
+		# Busybox ignores -xdev when combine with -delete and/or -depth.
+		# http://lists.busybox.net/pipermail/busybox-cvs/2012-December/033720.html
+		# Rather than take performance hit with alternative solutions,
+		# disallow mounting into cache directories and drop -xdev.
+		#
+		# /bedrock/var/cache/ should be on the same filesystem as
+		# /bedrock/libexec/busybox.  Save some disk writes and
+		# hardlink.
+		#
+		# busybox also lacks find -ctime, so implement it ourselves
+		# with a bit of overhead.
+		if ! [ -x "${dir}/busybox" ]; then
+			ln /bedrock/libexec/busybox "${dir}/busybox"
+		else
+			touch "${dir}/busybox"
+		fi
+		chroot "${dir}" /busybox find / -mindepth 1 ! -type d -exec /busybox sh -c "[ \"\$(stat -c \"%Z\" \"{}\")\" -lt \"${del_time}\" ] && rm -- \"{}\"" \;
+		# Remove all empty directories irrelevant of timestamp.  Only cache files.
+		chroot "${dir}" /busybox find / -depth -mindepth 1 -type d -exec /busybox rmdir -- "{}" \; >/dev/null 2>&1 || true
+
+		# If the cache directory only contains the above-created lock
+		# and busybox, it's no longer caching anything meaningful.
+		# Remove it.
+		if [ "$(echo "${dir}/"* | wc -w)" -le 2 ]; then
+			rm -f "${dir}/lock"
+			rm -f "${dir}/busybox"
+			rmdir "${dir}"
+		fi
+
+		drop_lock "${dir}"
+	done
+}
+
+#
+# pmm locking functions
+#
+# Bedrock lock management code is very shell oriented.   This makes it awkward
+# to use in the awk oriented pmm code.  Place it in the shared shell code for
+# pmm to shell out to.
+#
+
+pmm_cache_package_manager_list() {
+	lock /bedrock/var/cache/pmm
+	# pmm will export these variables
+	echo "${strata}" >/bedrock/var/cache/pmm/strata
+	# variable is inherited from function caller
+	# shellcheck disable=SC2154
+	echo "${bedrock_conf_sha1sum}" >/bedrock/var/cache/pmm/bedrock_conf_sha1sum
+	# pmm provides pair list via pipe
+	cat >/bedrock/var/cache/pmm/package_manager_list
+	exit_success
+}
+
+pmm_cache_package_manager_db() {
+	# pmm will export ${stratum} and ${package_manager}
+	# shellcheck disable=SC2154
+	lock "/bedrock/var/cache/pmm-${stratum}:${package_manager}"
+
+	db="/bedrock/var/cache/pmm-${stratum}:${package_manager}/package-db/"
+	ready="/bedrock/var/cache/pmm-${stratum}:${package_manager}/package-db-ready"
+	rm -rf "${db}" "${ready}"
+	mkdir -p "${db}"
+	cd "${db}"
+
+	# pmm provides db information via pipe
+	awk '
+	function brldbpath(name) {
+		if (substr(name,1,3) == "lib") {
+			return substr(name, 4, 2)
+		} else {
+			return substr(name, 1, 2)
+		}
+	}
+	{
+		print >> brldbpath($0)
+	}'
+
+	echo 1 >"${ready}"
+
+	exit_success
+}
+
+# List all strata irrelevant of their state.
+list_strata() {
+	find /bedrock/strata/ -maxdepth 1 -mindepth 1 -type d -exec basename {} \;
+}
+
+# List all aliases irrelevant of their state.
+list_aliases() {
+	find /bedrock/strata/ -maxdepth 1 -mindepth 1 -type l -exec basename {} \;
+}
+
+# Dereference a stratum alias.  If called on a non-alias stratum, that stratum
+# is returned.
+deref() {
+	alias="${1}"
+	if ! filepath="$(realpath "/bedrock/strata/${alias}" 2>/dev/null)"; then
+		return 1
+	elif ! name="$(basename "${filepath}")"; then
+		return 1
+	else
+		echo "${name}"
+	fi
+}
+
+# Checks if a given file has a given bedrock extended filesystem attribute.
+has_attr() {
+	file="${1}"
+	attr="${2}"
+	/bedrock/libexec/getfattr --only-values --absolute-names -n "user.bedrock.${attr}" "${file}" >/dev/null 2>&1
+}
+
+# Prints a given file's given bedrock extended filesystem attribute.
+get_attr() {
+	file="${1}"
+	attr="${2}"
+	printf "%s\\n" "$(/bedrock/libexec/getfattr --only-values --absolute-names -n "user.bedrock.${attr}" "${file}")"
+}
+
+# Sets a given file's given bedrock extended filesystem attribute.
+set_attr() {
+	file="${1}"
+	attr="${2}"
+	value="${3}"
+	/bedrock/libexec/setfattr -n "user.bedrock.${attr}" -v "${value}" "${file}"
+}
+
+# Removes a given file's given bedrock extended filesystem attribute.
+rm_attr() {
+	file="${1}"
+	attr="${2}"
+	if has_attr "${file}" "${attr}"; then
+		/bedrock/libexec/setfattr -x "user.bedrock.${attr}" "${file}"
+	fi
+}
+
+# Checks if argument is an existing stratum
+is_stratum() {
+	[ -d "/bedrock/strata/${1}" ] && ! [ -h "/bedrock/strata/${1}" ]
+}
+
+# Checks if argument is an existing alias
+is_alias() {
+	[ -h "/bedrock/strata/${1}" ]
+}
+
+# Checks if argument is an existing stratum or alias
+is_stratum_or_alias() {
+	[ -d "/bedrock/strata/${1}" ] || [ -h "/bedrock/strata/${1}" ]
+}
+
+# Checks if argument is an enabled stratum or alias
+is_enabled() {
+	[ -e "/bedrock/run/enabled_strata/$(deref "${1}")" ]
+}
+
+# Checks if argument is the init-providing stratum
+is_init() {
+	[ "$(deref init)" = "$(deref "${1}")" ]
+}
+
+# Checks if argument is the bedrock stratum
+is_bedrock() {
+	[ "bedrock" = "$(deref "${1}")" ]
+}
+
+# Prints the root of the given stratum from the point of view of the init
+# stratum.
+#
+# Sometimes this function's output is used directly, and sometimes it is
+# prepended to another path.  Use `--empty` in the latter situation to indicate
+# the init-providing stratum's root should be treated as an empty string to
+# avoid doubled up `/` characters.
+stratum_root() {
+	if [ "${1}" = "--empty" ]; then
+		init_root=""
+		shift
+	else
+		init_root="/"
+	fi
+
+	stratum="${1}"
+
+	if is_init "${stratum}"; then
+		echo "${init_root}"
+	else
+		echo "/bedrock/strata/$(deref "${stratum}")"
+	fi
+}
+
+# Applies /bedrock/etc/bedrock.conf symlink requirements to the specified stratum.
+#
+# Use `--force` to indicate that, should a scenario occur which cannot be
+# handled cleanly, remove problematic files.  Otherwise generate a warning.
+enforce_symlinks() {
+	force=false
+	if [ "${1}" = "--force" ]; then
+		force=true
+		shift
+	fi
+
+	stratum="${1}"
+	root="$(stratum_root --empty "${stratum}")"
+
+	for link in $(cfg_keys "symlinks"); do
+		proc_link="/proc/1/root${root}${link}"
+		tgt="$(cfg_values "symlinks" "${link}")"
+		proc_tgt="/proc/1/root${root}${tgt}"
+		cur_tgt="$(readlink "${proc_link}")" || true
+
+		if [ "${cur_tgt}" = "${tgt}" ]; then
+			# This is the desired situation.  Everything is already
+			# setup.
+			continue
+		elif [ -h "${proc_link}" ]; then
+			# The symlink exists but is pointing to the wrong
+			# location.  Fix it.
+			rm -f "${proc_link}"
+			ln -s "${tgt}" "${proc_link}"
+		elif ! [ -e "${proc_link}" ]; then
+			# Nothing exists at the symlink location.  Create it.
+			mkdir -p "$(dirname "${proc_link}")"
+			ln -s "${tgt}" "${proc_link}"
+		elif [ -e "${proc_link}" ] && [ -h "${proc_tgt}" ]; then
+			# Non-symlink file exists at symlink location and a
+			# symlink exists at the target location.  Swap them and
+			# ensure the symlink points where we want it to.
+			rm -f "${proc_tgt}"
+			mv "${proc_link}" "${proc_tgt}"
+			ln -s "${tgt}" "${proc_link}"
+		elif [ -e "${proc_link}" ] && ! [ -e "${proc_tgt}" ]; then
+			# Non-symlink file exists at symlink location, but
+			# nothing exists at tgt location.  Move file to
+			# tgt then create symlink.
+			mkdir -p "$(dirname "${proc_tgt}")"
+			mv "${proc_link}" "${proc_tgt}"
+			ln -s "${tgt}" "${proc_link}"
+		elif "${force}" && ! mounts_in_dir "${root}" | grep '.'; then
+			# A file exists both at the desired location and at the
+			# target location.  We do not know which of the two the
+			# user wishes to retain.  Since --force was indicated
+			# and we found no mount points to indicate otherwise,
+			# assume this is a newly fetched stratum and we are
+			# free to manipulate its files aggressively.
+			rm -rf "${proc_link}"
+			ln -s "${tgt}" "${proc_link}"
+		elif [ "${link}" = "/var/lib/dbus/machine-id" ]; then
+			# Both /var/lib/dbus/machine-id and the symlink target
+			# /etc/machine-id exist.  This occurs relatively often,
+			# such as when hand creating a stratum.  Rather than
+			# nag end-users, pick which to use ourselves.
+			rm -f "${proc_link}"
+			ln -s "${tgt}" "${proc_link}"
+		else
+			# A file exists both at the desired location and at the
+			# target location.  We do not know which of the two the
+			# user wishes to retain.  Play it safe and just
+			# generate a warning.
+			printf "${color_warn}WARNING: File or directory exists at both \`${proc_link}\` and \`${proc_tgt}\`.  Bedrock Linux expects only one to exist.  Inspect both and determine which you wish to keep, then remove the other, and finally run \`brl repair ${stratum}\` to remedy the situation.${color_norm}\\n"
+		fi
+	done
+}
+
+enforce_shells() {
+	for stratum in $(/bedrock/bin/brl list); do
+		root="$(stratum_root --empty "${stratum}")"
+		shells="/proc/1/root${root}/etc/shells"
+		if [ -r "${shells}" ]; then
+			cat "/proc/1/root/${root}/etc/shells"
+		fi
+	done | awk -F/ '/^\// {print "/bedrock/cross/bin/"$NF}' |
+		sort | uniq >/bedrock/run/shells
+
+	for stratum in $(/bedrock/bin/brl list); do
+		root="$(stratum_root --empty "${stratum}")"
+		shells="/proc/1/root${root}/etc/shells"
+		if ! [ -r "${shells}" ] || [ "$(awk '/^\/bedrock\/cross\/bin\//' "${shells}")" != "$(cat /bedrock/run/shells)" ]; then
+			(
+				if [ -r "${shells}" ]; then
+					cat "${shells}"
+				fi
+				cat /bedrock/run/shells
+			) | sort | uniq >"${shells}-"
+			mv "${shells}-" "${shells}"
+		fi
+	done
+	rm -f /bedrock/run/shells
+}
+
+ensure_line() {
+	file="${1}"
+	good_regex="${2}"
+	bad_regex="${3}"
+	value="${4}"
+
+	if grep -q "${good_regex}" "${file}"; then
+		true
+	elif grep -q "${bad_regex}" "${file}"; then
+		sed "s!${bad_regex}!${value}!" "${file}" >"${file}-new"
+		mv "${file}-new" "${file}"
+	else
+		(
+			cat "${file}"
+			echo "${value}"
+		) >"${file}-new"
+		mv "${file}-new" "${file}"
+	fi
+}
+
+enforce_id_ranges() {
+	for stratum in $(/bedrock/bin/brl list); do
+		# /etc/login.defs is global such that in theory we only need to
+		# update one file.  However, the logic to potentially update
+		# multiple is retained in case it is ever made local.
+		cfg="/bedrock/strata/${stratum}/etc/login.defs"
+		if [ -e "${cfg}" ]; then
+			ensure_line "${cfg}" "^[ \t]*UID_MIN[ \t][ \t]*1000$" "^[ \t]*UID_MIN\>.*$" "UID_MIN 1000"
+			ensure_line "${cfg}" "^[ \t]*UID_MAX[ \t][ \t]*65534$" "^[ \t]*UID_MAX\>.*$" "UID_MAX 65534"
+			ensure_line "${cfg}" "^[ \t]*SYS_UID_MIN[ \t][ \t]*1$" "^[ \t]*SYS_UID_MIN\>.*$" "SYS_UID_MIN 1"
+			ensure_line "${cfg}" "^[ \t]*SYS_UID_MAX[ \t][ \t]*999$" "^[ \t]*SYS_UID_MAX\>.*$" "SYS_UID_MAX 999"
+			ensure_line "${cfg}" "^[ \t]*GID_MIN[ \t][ \t]*1000$" "^[ \t]*GID_MIN\>.*$" "GID_MIN 1000"
+			ensure_line "${cfg}" "^[ \t]*GID_MAX[ \t][ \t]*65534$" "^[ \t]*GID_MAX\>.*$" "GID_MAX 65534"
+			ensure_line "${cfg}" "^[ \t]*SYS_GID_MIN[ \t][ \t]*1$" "^[ \t]*SYS_GID_MIN\>.*$" "SYS_GID_MIN 1"
+			ensure_line "${cfg}" "^[ \t]*SYS_GID_MAX[ \t][ \t]*999$" "^[ \t]*SYS_GID_MAX\>.*$" "SYS_GID_MAX 999"
+		fi
+		cfg="/bedrock/strata/${stratum}/etc/adduser.conf"
+		if [ -e "${cfg}" ]; then
+			ensure_line "${cfg}" "^FIRST_UID=1000$" "^FIRST_UID=.*$" "FIRST_UID=1000"
+			ensure_line "${cfg}" "^LAST_UID=65534$" "^LAST_UID=.*$" "LAST_UID=65534"
+			ensure_line "${cfg}" "^FIRST_SYSTEM_UID=1$" "^FIRST_SYSTEM_UID=.*$" "FIRST_SYSTEM_UID=1"
+			ensure_line "${cfg}" "^LAST_SYSTEM_UID=999$" "^LAST_SYSTEM_UID=.*$" "LAST_SYSTEM_UID=999"
+			ensure_line "${cfg}" "^FIRST_GID=1000$" "^FIRST_GID=.*$" "FIRST_GID=1000"
+			ensure_line "${cfg}" "^LAST_GID=65534$" "^LAST_GID=.*$" "LAST_GID=65534"
+			ensure_line "${cfg}" "^FIRST_SYSTEM_GID=1$" "^FIRST_SYSTEM_GID=.*$" "FIRST_SYSTEM_GID=1"
+			ensure_line "${cfg}" "^LAST_SYSTEM_GID=999$" "^LAST_SYSTEM_GID=.*$" "LAST_SYSTEM_GID=999"
+		fi
+	done
+}
+
+# List of architectures Bedrock Linux supports.
+brl_archs() {
+	cat <<EOF
+aarch64
+armv7hl
+armv7l
+mips
+mipsel
+mips64el
+ppc
+ppc64
+ppc64le
+s390x
+i386
+i486
+i586
+i686
+x86_64
+EOF
+}
+
+#
+# Many distros have different phrasing for the same exact CPU architecture.
+# Standardize witnessed variations against Bedrock's convention.
+#
+standardize_architecture() {
+	case "${1}" in
+	aarch64 | arm64) echo "aarch64" ;;
+	armhf | armhfp | armv7h | armv7hl | armv7a) echo "armv7hl" ;;
+	arm | armel | armle | arm7 | armv7 | armv7l | armv7a_hardfp) echo "armv7l" ;;
+	i386) echo "i386" ;;
+	i486) echo "i486" ;;
+	i586) echo "i586" ;;
+	x86 | i686) echo "i686" ;;
+	mips | mipsbe | mipseb) echo "mips" ;;
+	mipsel | mipsle) echo "mipsel" ;;
+	mips64el | mips64le) echo "mips64el" ;;
+	ppc | ppc32 | powerpc | powerpc32) echo "ppc" ;;
+	ppc64 | powerpc64) echo "ppc64" ;;
+	ppc64el | ppc64le | powerpc64el | powerpc64le) echo "ppc64le" ;;
+	s390x) echo "s390x" ;;
+	amd64 | x86_64) echo "x86_64" ;;
+	esac
+}
+
+get_system_arch() {
+	if ! system_arch="$(standardize_architecture "$(get_attr "/bedrock/strata/bedrock/" "arch")")" || [ -z "${system_arch}" ]; then
+		system_arch="$(standardize_architecture "$(uname -m)")"
+	fi
+	if [ -z "${system_arch}" ]; then
+		abort "Unable to determine system CPU architecture"
+	fi
+	echo "${system_arch}"
+}
+
+check_arch_supported_natively() {
+	arch="${1}"
+	system_arch="$(get_system_arch)"
+	if [ "${system_arch}" = "${arch}" ]; then
+		return
+	fi
+
+	case "${system_arch}:${arch}" in
+	aarch64:armv7hl) return ;;
+	aarch64:armv7l) return ;;
+	armv7hl:armv7l) return ;;
+	# Not technically true, but binfmt does not differentiate
+	armv7l:armv7hl) return ;;
+	ppc64:ppc) return ;;
+	ppc64le:ppc) return ;;
+	x86_64:i386) return ;;
+	x86_64:i486) return ;;
+	x86_64:i586) return ;;
+	x86_64:i686) return ;;
+	esac
+
+	false
+}
+
+qemu_binary_for_arch() {
+	case "${1}" in
+	aarch64) echo "qemu-aarch64-static" ;;
+	i386) echo "qemu-i386-static" ;;
+	i486) echo "qemu-i386-static" ;;
+	i586) echo "qemu-i386-static" ;;
+	i686) echo "qemu-i386-static" ;;
+	armv7hl) echo "qemu-arm-static" ;;
+	armv7l) echo "qemu-arm-static" ;;
+	mips) echo "qemu-mips-static" ;;
+	mipsel) echo "qemu-mipsel-static" ;;
+	mips64el) echo "qemu-mips64el-static" ;;
+	ppc) echo "qemu-ppc-static" ;;
+	ppc64) echo "qemu-ppc64-static" ;;
+	ppc64le) echo "qemu-ppc64le-static" ;;
+	s390x) echo "qemu-s390x-static" ;;
+	x86_64) echo "qemu-x86_64-static" ;;
+	esac
+}
+
+setup_binfmt_misc() {
+	stratum="${1}"
+	mount="/proc/sys/fs/binfmt_misc"
+
+	arch="$(get_attr "/bedrock/strata/${stratum}" "arch" 2>/dev/null)" || true
+
+	# If stratum is native, skip setting up binfmt_misc
+	if [ -z "${arch}" ] || check_arch_supported_natively "${arch}"; then
+		return
+	fi
+
+	# ensure module is loaded
+	if ! [ -d "${mount}" ]; then
+		modprobe binfmt_misc
+	fi
+	if ! [ -d "${mount}" ]; then
+		abort "Unable to mount binfmt_misc to register handler for ${stratum}"
+	fi
+
+	# mount binfmt_misc if it is not already mounted
+	if ! [ -r "${mount}/register" ]; then
+		mount binfmt_misc -t binfmt_misc "${mount}"
+	fi
+	if ! [ -r "${mount}/register" ]; then
+		abort "Unable to mount binfmt_misc to register handler for ${stratum}"
+	fi
+
+	# Gather information needed to register with binfmt
+	unset name
+	unset sum
+	unset reg
+	case "${arch}" in
+	aarch64)
+		name="qemu-aarch64"
+		sum="707cf2bfbdb58152fc97ed4c1643ecd16b064465"
+		reg=':qemu-aarch64:M:0:\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xb7\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/qemu-aarch64-static:OC'
+		;;
+	armv7l | armv7hl)
+		name="qemu-arm"
+		sum="bbada633c3eda72c9be979357b51c0ac8edb9eba"
+		reg=':qemu-arm:M:0:\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x28\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/qemu-arm-static:OC'
+		;;
+	mips)
+		name="qemu-mips"
+		sum="5751a5cf2bbc2cb081d314f4b340ca862c11b90c"
+		reg=':qemu-mips:M:0:\x7fELF\x01\x02\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x08:\xff\xff\xff\xff\xff\xff\xff\x00\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff:/usr/bin/qemu-mips-static:OC'
+		;;
+	mipsel)
+		name="qemu-mipsel"
+		sum="2bccf248508ffd8e460b211f5f4159906754a498"
+		reg=':qemu-mipsel:M:0:\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x08\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xfe\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/qemu-mipsel-static:OC'
+		;;
+	mips64el)
+		name="qemu-mips64el"
+		sum="ed9513fa110eed9085cf21a789a55e047f660237"
+		reg=':qemu-mips64el:M:0:\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x08\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xfe\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/qemu-mips64el-static:OC'
+		;;
+	ppc)
+		name="qemu-ppc"
+		sum="da30ac101e6b9b5abeb975542c4420ad4e1a38a9"
+		reg=':qemu-ppc:M:0:\x7fELF\x01\x02\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x14:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff:/usr/bin/qemu-ppc-static:OC'
+		;;
+	ppc64)
+		name="qemu-ppc64"
+		sum="92eedc92be15ada7ee3d5703253f4e7744021a73"
+		reg=':qemu-ppc64:M:0:\x7fELF\x02\x02\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x15:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff:/usr/bin/qemu-ppc64-static:OC'
+		;;
+	ppc64le)
+		name="qemu-ppc64le"
+		sum="b42c326e62f05cae1d412d3b5549a06228aeb409"
+		reg=':qemu-ppc64le:M:0:\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x15\x00:\xff\xff\xff\xff\xff\xff\xff\xfc\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\x00:/usr/bin/qemu-ppc64le-static:OC'
+		;;
+	s390x)
+		name="qemu-s390x"
+		sum="9aed062ea40b5388fd4dea5e5da837c157854021"
+		reg=':qemu-s390x:M:0:\x7fELF\x02\x02\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x16:\xff\xff\xff\xff\xff\xff\xff\xfc\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff:/usr/bin/qemu-s390x-static:OC'
+		;;
+	i386 | i486 | i586 | i686)
+		name="qemu-i386"
+		sum="59723d1b5d3983ff606ff2befc151d0a26543707"
+		reg=':qemu-i386:M:0:\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x03\x00:\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\xfe\xff\xff\xff:/usr/bin/qemu-i386-static:OC'
+		;;
+	x86_64)
+		name="qemu-x86_64"
+		sum="823c58bdb19743335c68d036fdc795e3be57e243"
+		reg=':qemu-x86_64:M:0:\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/qemu-x86_64-static:OC'
+		;;
+	*)
+		abort "Stratum \"${stratum}\" has unrecognized arch ${arch}"
+		;;
+	esac
+
+	# Remove registration with differing values.
+	if [ -r "${mount}/${name}" ] && [ "$(sha1sum "${mount}/${name}" | awk '{print$1}')" != "${sum}" ]; then
+		notice "Removing conflicting ${arch} binfmt registration"
+		echo '-1' >"${mount}/${name}"
+	fi
+
+	# Register if not already registered
+	if ! [ -r "${mount}/${name}" ]; then
+		echo "${reg}" >"${mount}/register"
+	fi
+	# Enable
+	printf "1" >"${mount}/${name}"
+	printf "1" >"${mount}/status"
+}
+
+# Run executable in /bedrock/libexec with init stratum.
+#
+# Requires the init stratum to be enabled, which is typically true in a
+# healthy, running Bedrock system.
+stinit() {
+	cmd="${1}"
+	shift
+	/bedrock/bin/strat init "/bedrock/libexec/${cmd}" "${@:-}"
+}
+
+# Kill all processes chrooted into the specified directory or a subdirectory
+# thereof.
+#
+# Use `--init` to indicate this should be run from the init stratum's point of
+# view.
+kill_chroot_procs() {
+	if [ "${1:-}" = "--init" ]; then
+		x_readlink="stinit busybox readlink"
+		x_realpath="stinit busybox realpath"
+		shift
+	else
+		x_readlink="readlink"
+		x_realpath="realpath"
+	fi
+
+	dir="$(${x_realpath} "${1}")"
+
+	require_root
+
+	sent_sigterm=false
+
+	# Try SIGTERM.  Since this is not atomic - a process could spawn
+	# between recognition of its parent and killing its parent - try
+	# multiple times to minimize the chance we miss one.
+	for _ in $(seq 1 5); do
+		for pid in $(ps -A -o pid); do
+			root="$(${x_readlink} "/proc/${pid}/root")" || continue
+
+			case "${root}" in
+			"${dir}" | "${dir}/"*)
+				kill "${pid}" 2>/dev/null || true
+				sent_sigterm=true
+				;;
+			esac
+		done
+	done
+
+	# If we sent SIGTERM to any process, give it time to finish then
+	# ensure it is dead with SIGKILL.  Again, try multiple times just in
+	# case new processes spawn.
+	if "${sent_sigterm}"; then
+		# sleep for a quarter second
+		usleep 250000
+		for _ in $(seq 1 5); do
+			for pid in $(ps -A -o pid); do
+				root="$(${x_readlink} "/proc/${pid}/root")" || continue
+
+				case "${root}" in
+				"${dir}" | "${dir}/"*)
+					kill -9 "${pid}" 2>/dev/null || true
+					;;
+				esac
+			done
+		done
+	fi
+
+	# Unless we were extremely unlucky with kill/spawn race conditions or
+	# zombies, all target processes should be dead.  Check our work just in
+	# case.
+	for pid in $(ps -A -o pid); do
+		root="$(${x_readlink} "/proc/${pid}/root")" || continue
+
+		case "${root}" in
+		"${dir}" | "${dir}/"*)
+			abort "Unable to kill all processes within \"${dir}\"."
+			;;
+		esac
+	done
+}
+
+# List all mounts on or under a given directory.
+#
+# Use `--init` to indicate this should be run from the init stratum's point of
+# view.
+mounts_in_dir() {
+	if [ "${1:-}" = "--init" ]; then
+		x_realpath="stinit busybox realpath"
+		pid="1"
+		shift
+	else
+		x_realpath="realpath"
+		pid="${$}"
+	fi
+
+	# If the directory does not exist, there cannot be any mount points on/under it.
+	if ! dir="$(${x_realpath} "${1}" 2>/dev/null)"; then
+		return
+	fi
+
+	awk -v"dir=${dir}" -v"subdir=${dir}/" '
+		$5 == dir || substr($5, 1, length(subdir)) == subdir {
+			print $5
+		}
+	' "/proc/${pid}/mountinfo"
+}
+
+# Unmount all mount points in a given directory or its subdirectories.
+#
+# Use `--init` to indicate this should be run from the init stratum's point of
+# view.
+umount_r() {
+	if [ "${1:-}" = "--init" ]; then
+		x_mount="stinit busybox mount"
+		x_umount="stinit busybox umount"
+		init_flag="--init"
+		shift
+	else
+		x_mount="mount"
+		x_umount="umount"
+		init_flag=""
+	fi
+
+	dir="${1}"
+
+	# shellcheck disable=SC2086
+	cur_cnt=$(mounts_in_dir ${init_flag} "${dir}" | wc -l)
+	prev_cnt=$((cur_cnt + 1))
+	while [ "${cur_cnt}" -lt "${prev_cnt}" ]; do
+		prev_cnt=${cur_cnt}
+		# shellcheck disable=SC2086
+		for mount in $(mounts_in_dir ${init_flag} "${dir}" | sort -ru); do
+			${x_mount} --make-rprivate "${mount}" 2>/dev/null || true
+		done
+		# shellcheck disable=SC2086
+		for mount in $(mounts_in_dir ${init_flag} "${dir}" | sort -ru); do
+			${x_mount} --make-rprivate "${mount}" 2>/dev/null || true
+			${x_umount} -l "${mount}" 2>/dev/null || true
+		done
+		# shellcheck disable=SC2086
+		cur_cnt="$(mounts_in_dir ${init_flag} "${dir}" | wc -l || true)"
+	done
+
+	# shellcheck disable=SC2086
+	if mounts_in_dir ${init_flag} "${dir}" | grep -q '.'; then
+		abort "Unable to unmount all mounts at \"${dir}\"."
+	fi
+}
+
+disable_stratum() {
+	stratum="${1}"
+
+	# Remove stratum from /bedrock/cross.  This needs to happen before the
+	# stratum is disabled so that crossfs does not try to use a disabled
+	# stratum's processes and get confused, as crossfs does not check/know
+	# about /bedrock/run/enabled_strata.
+	cfg_crossfs_rm_strata "/proc/1/root/bedrock/strata/bedrock/bedrock/cross" "${stratum}"
+
+	# Mark the stratum as disabled so nothing else tries to use the
+	# stratum's files while we're disabling it.
+	rm -f "/bedrock/run/enabled_strata/${stratum}"
+
+	# Kill all running processes.
+	root="$(stratum_root "${stratum}")"
+	kill_chroot_procs --init "${root}"
+	# Remove all mounts.
+	root="$(stratum_root "${stratum}")"
+	umount_r --init "${root}"
+}
+
+# Attempt to remove a directory while minimizing the chance of accidentally
+# removing desired files.  Prefer aborting over accidentally removing the wrong
+# file.
+less_lethal_rm_rf() {
+	dir="${1}"
+
+	count=1
+	while ! rmdir "${dir}" 2>/dev/null && [ "${count}" -le 3 ]; do
+		count=$((count + 1))
+		kill_chroot_procs "${dir}"
+		umount_r "${dir}"
+
+		# Busybox ignores -xdev when combine with -delete and/or -depth, and
+		# thus -delete and -depth must not be used.
+		# http://lists.busybox.net/pipermail/busybox-cvs/2012-December/033720.html
+
+		# Remove all non-directories.  Transversal order does not matter.
+		cp /proc/self/exe "${dir}/busybox"
+		chroot "${dir}" ./busybox find / -xdev -mindepth 1 ! -type d -exec rm {} \; || true
+
+		# Remove all directories.
+		# We cannot force `find` to traverse depth-first.  We also cannot rely
+		# on `sort` in case a directory has a newline in it.  Instead, retry while tracking how much is left
+		cp /proc/self/exe "${dir}/busybox"
+		current="$(chroot "${dir}" ./busybox find / -xdev -mindepth 1 -type d -exec echo x \; | wc -l)"
+		prev=$((current + 1))
+		while [ "${current}" -lt "${prev}" ]; do
+			chroot "${dir}" ./busybox find / -xdev -mindepth 1 -type d -exec rmdir {} \; 2>/dev/null || true
+			prev="${current}"
+			current="$(chroot "${dir}" ./busybox find / -xdev -mindepth 1 -type d -exec echo x \; | wc -l)"
+		done
+
+		rm "${dir}/busybox"
+	done
+	! [ -e "${dir}" ]
+}
+
+# Prints colon-separated information about stratum's given mount point:
+#
+# - The mount point's filetype, or "missing" if there is no mount point.
+# - "true"/"false" indicating if the mount point is global
+# - "true"/"false" indicating if shared (i.e. child mounts will be global)
+mount_details() {
+	stratum="${1:-}"
+	mount="${2:-}"
+
+	root="$(stratum_root --empty "${stratum}")"
+	br_root="/bedrock/strata/bedrock"
+
+	if ! path="$(stinit busybox realpath "${root}${mount}" 2>/dev/null)"; then
+		echo "missing:false:false"
+		return
+	fi
+
+	# Get filesystem
+	mountline="$(awk -v"mnt=${path}" '$5 == mnt' "/proc/1/mountinfo")"
+	if [ -z "${mountline}" ]; then
+		echo "missing:false:false"
+		return
+	fi
+	filesystem="$(echo "${mountline}" | awk '{
+		for (i=7; i<NF; i++) {
+			if ($i == "-") {
+				print$(i+1)
+				exit
+			}
+		}
+	}')"
+
+	if ! br_path="$(stinit busybox realpath "${br_root}${mount}" 2>/dev/null)"; then
+		echo "${filesystem}:false:false"
+		return
+	fi
+
+	# Get global
+	global=false
+	if is_bedrock "${stratum}"; then
+		global=true
+	elif [ "${mount}" = "/etc" ] && [ "${filesystem}" = "fuse.etcfs" ]; then
+		# /etc is a virtual filesystem that needs to exist per-stratum,
+		# and thus the check below would indicate it is local.
+		# However, the actual filesystem implementation effectively
+		# implements global redirects, and thus it should be considered
+		# global.
+		global=true
+	else
+		path_stat="$(stinit busybox stat "${path}" 2>/dev/null | awk '$1 == "File:" {$2=""} $5 == "Links:" {$6=""}1')"
+		br_path_stat="$(stinit busybox stat "${br_path}" 2>/dev/null | awk '$1 == "File:" {$2=""} $5 == "Links:" {$6=""}1')"
+		if [ "${path_stat}" = "${br_path_stat}" ]; then
+			global=true
+		fi
+	fi
+
+	# Get shared
+	shared_nr="$(echo "${mountline}" | awk '{
+		for (i=7; i<NF; i++) {
+			if ($i ~ "shared:[0-9]"){
+				substr(/shared:/,"",$i)
+				print $i
+				exit
+			} else if ($i == "-"){
+				print ""
+				exit
+			}
+		}
+	}')"
+	br_mountline="$(awk -v"mnt=${br_path}" '$5 == mnt' "/proc/1/mountinfo")"
+	if [ -z "${br_mountline}" ]; then
+		br_shared_nr=""
+	else
+		br_shared_nr="$(echo "${br_mountline}" | awk '{
+			for (i=7; i<NF; i++) {
+				if ($i ~ "shared:[0-9]"){
+					substr(/shared:/,"",$i)
+					print $i
+					exit
+				} else if ($i == "-"){
+					print ""
+					exit
+				}
+			}
+		}')"
+	fi
+	if [ -n "${shared_nr}" ] && [ "${shared_nr}" = "${br_shared_nr}" ]; then
+		shared=true
+	else
+		shared=false
+	fi
+
+	echo "${filesystem}:${global}:${shared}"
+	return
+}
+
+# Pre-parse bedrock.conf:
+#
+# - join any continued lines
+# - strip comments
+# - drop blank lines
+cfg_preparse() {
+	awk -v"RS=" '{
+		# join continued lines
+		gsub(/\\\n/, "")
+		print
+	}' /bedrock/etc/bedrock.conf | awk '
+	/[#;]/ {
+		# strip comments
+		sub(/#.*$/, "")
+		sub(/;.*$/, "")
+	}
+	# print non-blank lines
+	/[^ \t\r\n]/'
+}
+
+# Print all bedrock.conf sections
+cfg_sections() {
+	cfg_preparse | awk '
+	/^[ \t\r]*\[.*\][ \t\r]*$/ {
+		sub(/^[ \t\r]*\[[ \t\r]*/, "")
+		sub(/[ \t\r]*\][ \t\r]*$/, "")
+		print
+	}'
+}
+
+# Print all bedrock.conf keys in specified section
+cfg_keys() {
+	cfg_preparse | awk -v"tgt_section=${1}" '
+	/^[ \t\r]*\[.*\][ \t\r]*$/ {
+		sub(/^[ \t\r]*\[[ \t\r]*/, "")
+		sub(/[ \t\r]*\][ \t\r]*$/, "")
+		in_section = ($0 == tgt_section)
+		next
+	}
+	/=/ && in_section {
+		key = substr($0, 0, index($0, "=")-1)
+		gsub(/[ \t\r]*/, "", key)
+		print key
+	}'
+}
+
+# Print bedrock.conf value for specified section and key.  Assumes only one
+# value and does not split value.
+cfg_value() {
+	cfg_preparse | awk -v"tgt_section=${1}" -v"tgt_key=${2}" '
+	/^[ \t\r]*\[.*\][ \t\r]*$/ {
+		sub(/^[ \t\r]*\[[ \t\r]*/, "")
+		sub(/[ \t\r]*\][ \t\r]*$/, "")
+		in_section = ($0 == tgt_section)
+		next
+	}
+	/=/ && in_section {
+		key = substr($0, 0, index($0, "=")-1)
+		gsub(/[ \t\r]*/, "", key)
+		if (key != tgt_key) {
+			next
+		}
+		value = substr($0, index($0, "=")+1)
+		gsub(/^[ \t\r]*/, "", value)
+		gsub(/[ \t\r]*$/, "", value)
+		print value
+	}'
+}
+
+# Print bedrock.conf values for specified section and key.  Expects one or more
+# values in a comma-separated list and splits accordingly.
+cfg_values() {
+	cfg_preparse | awk -v"tgt_section=${1}" -v"tgt_key=${2}" '
+	/^[ \t\r]*\[.*\][ \t\r]*$/ {
+		sub(/^[ \t\r]*\[[ \t\r]*/, "")
+		sub(/[ \t\r]*\][ \t\r]*$/, "")
+		in_section = ($0 == tgt_section)
+		next
+	}
+	/=/ && in_section {
+		key = substr($0, 0, index($0, "=")-1)
+		gsub(/[ \t\r]*/, "", key)
+		if (key != tgt_key) {
+			next
+		}
+		values_string = substr($0, index($0, "=")+1)
+		values_len = split(values_string, values, ",")
+		for (i = 1; i <= values_len; i++) {
+			sub(/^[ \t\r]*/, "", values[i])
+			sub(/[ \t\r]*$/, "", values[i])
+			print values[i]
+		}
+	}'
+}
+
+dedup_filter_envvar() {
+	envvar=""
+	IFS=":"
+	# shellcheck disable=SC2068
+	for i in ${@}; do
+		case "${i}" in
+		"") continue ;;
+		"/root/"*) continue ;;
+		"/home/"*) continue ;;
+		"/bedrock/"*) continue ;;
+		esac
+		case ":${envvar}:" in
+		*":${i}:"*) ;;
+		*) envvar="${envvar}:${i}" ;;
+		esac
+	done
+	echo "${envvar}" | sed -e 's/::*/:/g' -e 's/^://' -e 's/:$//'
+}
+
+# Configure crossfs mount point per bedrock.conf configuration.
+cfg_crossfs() {
+	mount="${1}"
+
+	# For the purposes here, treat local alias as a stratum.  We do not
+	# want to dereference it, but rather pass it directly to crossfs.  It
+	# will dereference it at runtime.
+
+	strata=""
+	for stratum in $(list_strata); do
+		if is_enabled "${stratum}" && has_attr "/bedrock/strata/${stratum}" "show_cross"; then
+			strata="${strata} ${stratum}"
+		fi
+	done
+
+	aliases=""
+	for alias in $(list_aliases); do
+		if [ "${alias}" = "local" ]; then
+			continue
+		fi
+		if ! stratum="$(deref "${alias}")"; then
+			continue
+		fi
+		if is_enabled "${stratum}" && has_attr "/bedrock/strata/${stratum}" "show_cross"; then
+			aliases="${aliases} ${alias}:${stratum}"
+		fi
+	done
+
+	PREFIX_PATH="$(cfg_value "env-vars" "PREFIX:PATH"):$(cfg_value "env-vars" "PATH")"
+	SUFFIX_PATH="$(cfg_value "env-vars" "INFIX:PATH"):$(cfg_value "env-vars" "SUFFIX:PATH")"
+	PREFIX_MANPATH="$(cfg_value "env-vars" "PREFIX:MANPATH"):$(cfg_value "env-vars" "MANPATH")"
+	SUFFIX_MANPATH="$(cfg_value "env-vars" "INFIX:MANPATH"):$(cfg_value "env-vars" "SUFFIX:MANPATH")"
+	PREFIX_INFOPATH="$(cfg_value "env-vars" "PREFIX:INFOPATH"):$(cfg_value "env-vars" "INFOPATH")"
+	SUFFIX_INFOPATH="$(cfg_value "env-vars" "INFIX:INFOPATH"):$(cfg_value "env-vars" "SUFFIX:INFOPATH")"
+	PREFIX_XDG_DATA_DIRS="$(cfg_value "env-vars" "PREFIX:XDG_DATA_DIRS"):$(cfg_value "env-vars" "XDG_DATA_DIRS")"
+	SUFFIX_XDG_DATA_DIRS="$(cfg_value "env-vars" "INFIX:XDG_DATA_DIRS"):$(cfg_value "env-vars" "SUFFIX:XDG_DATA_DIRS")"
+	PREFIX_TERMINFO_DIRS="$(cfg_value "env-vars" "PREFIX:TERMINFO_DIRS"):$(cfg_value "env-vars" "TERMINFO_DIRS")"
+	SUFFIX_TERMINFO_DIRS="$(cfg_value "env-vars" "INFIX:TERMINFO_DIRS"):$(cfg_value "env-vars" "SUFFIX:TERMINFO_DIRS")"
+	PREFIX_fpath="$(cfg_value "env-vars" "PREFIX:fpath"):$(cfg_value "env-vars" "fpath")"
+	SUFFIX_fpath="$(cfg_value "env-vars" "INFIX:fpath"):$(cfg_value "env-vars" "SUFFIX:fpath")"
+
+	envvarmap=''
+	localPATH=''
+	localMANPATH=''
+	localINFOPATH=''
+	localXDG_DATA_DIRS=''
+	localTERMINFO_DIRS=''
+	localfpath=''
+	for s in $(/bedrock/bin/brl list); do
+		if [ -r "/bedrock/strata/${s}/etc/profile" ]; then
+			out="$(/bedrock/bin/strat -r "${s}" /bin/sh -c '. /etc/profile ; env' 2>/dev/null)" || true
+		else
+			out=""
+		fi
+		fpath="$(/bedrock/bin/strat -r "${s}" zsh -l -c "echo \"fpath=\${fpath}\"" 2>/dev/null | grep '^fpath=' | cut -d= -f2-)" || true
+
+		# shellcheck disable=SC20089
+		envvarmap="${envvarmap}
+		envvarmap[\"${s}:\$PATH\"]=\"$(dedup_filter_envvar "${PREFIX_PATH}:$(echo "${out}" | awk -F= '/^PATH=/{sub(/^PATH=/,"");print;exit}'):${SUFFIX_PATH}")\"
+		envvarmap[\"${s}:\$MANPATH\"]=\"$(dedup_filter_envvar "${PREFIX_MANPATH}:$(echo "${out}" | awk -F= '/^MANPATH=/{sub(/^MANPATH=/,"");print;exit}'):${SUFFIX_MANPATH}")\"
+		envvarmap[\"${s}:\$INFOPATH\"]=\"$(dedup_filter_envvar "${PREFIX_INFOPATH}:$(echo "${out}" | awk -F= '/^INFOPATH=/{sub(/^INFOPATH=/,"");print;exit}'):${SUFFIX_INFOPATH}")\"
+		envvarmap[\"${s}:\$XDG_DATA_DIRS\"]=\"$(dedup_filter_envvar "${PREFIX_XDG_DATA_DIRS}:$(echo "${out}" | awk -F= '/^XDG_DATA_DIRS=/{sub(/^XDG_DATA_DIRS=/,"");print;exit}'):${SUFFIX_XDG_DATA_DIRS}")\"
+		envvarmap[\"${s}:\$TERMINFO_DIRS\"]=\"$(dedup_filter_envvar "${PREFIX_TERMINFO_DIRS}:$(echo "${out}" | awk -F= '/^TERMINFO_DIRS=/{sub(/^TERMINFO_DIRS=/,"");print;exit}'):${SUFFIX_TERMINFO_DIRS}")\"
+		envvarmap[\"${s}:\$fpath\"]=\"$(dedup_filter_envvar "${PREFIX_fpath}:$(echo "${fpath}" | sed 's/ /:/g'):${SUFFIX_fpath}")\"
+		"
+		localPATH="$(dedup_filter_envvar "${localPATH}:$(echo "${out}" | awk -F= '/^PATH=/{sub(/^PATH=/,"");print;exit}')")"
+		localMANPATH="$(dedup_filter_envvar "${localMANPATH}:$(echo "${out}" | awk -F= '/^MANPATH=/{sub(/^MANPATH=/,"");print;exit}')")"
+		localINFOPATH="$(dedup_filter_envvar "${localINFOPATH}:$(echo "${out}" | awk -F= '/^INFOPATH=/{sub(/^INFOPATH=/,"");print;exit}')")"
+		localXDG_DATA_DIRS="$(dedup_filter_envvar "${localXDG_DATA_DIRS}:$(echo "${out}" | awk -F= '/^XDG_DATA_DIRS=/{sub(/^XDG_DATA_DIRS=/,"");print;exit}')")"
+		localTERMINFO_DIRS="$(dedup_filter_envvar "${localTERMINFO_DIRS}:$(echo "${out}" | awk -F= '/^TERMINFO_DIRS=/{sub(/^TERMINFO_DIRS=/,"");print;exit}')")"
+		localfpath="$(dedup_filter_envvar "${localfpath}:$(echo "${fpath}" | sed 's/ /:/g')")"
+	done
+	envvarmap="${envvarmap}
+	envvarmap[\"local:\$PATH\"]=\"$(dedup_filter_envvar "${PREFIX_PATH}:${localPATH}:${SUFFIX_PATH}")\"
+	envvarmap[\"local:\$MANPATH\"]=\"$(dedup_filter_envvar "${PREFIX_MANPATH}:${localMANPATH}:${SUFFIX_MANPATH}")\"
+	envvarmap[\"local:\$INFOPATH\"]=\"$(dedup_filter_envvar "${PREFIX_INFOPATH}:${localINFOPATH}:${SUFFIX_INFOPATH}")\"
+	envvarmap[\"local:\$XDG_DATA_DIRS\"]=\"$(dedup_filter_envvar "${PREFIX_XDG_DATA_DIRS}:${localXDG_DATA_DIRS}:${SUFFIX_XDG_DATA_DIRS}")\"
+	envvarmap[\"local:\$TERMINFO_DIRS\"]=\"$(dedup_filter_envvar "${PREFIX_TERMINFO_DIRS}:${localTERMINFO_DIRS}:${SUFFIX_TERMINFO_DIRS}")\"
+	envvarmap[\"local:\$fpath\"]=\"$(dedup_filter_envvar "${PREFIX_fpath}:${localfpath}:${SUFFIX_fpath}")\"
+	"
+
+	cfg_preparse | awk \
+		-v"unordered_strata_string=${strata}" \
+		-v"alias_string=$aliases" \
+		-v"fscfg=${mount}/.bedrock-config-filesystem" '
+	BEGIN {
+		# Create list of available strata
+		len = split(unordered_strata_string, n_unordered_strata, " ")
+		for (i = 1; i <= len; i++) {
+			unordered_strata[n_unordered_strata[i]] = n_unordered_strata[i]
+		}
+		# Create alias look-up table
+		len = split(alias_string, n_aliases, " ")
+		for (i = 1; i <= len; i++) {
+			split(n_aliases[i], a, ":")
+			aliases[a[1]] = a[2]
+		}
+		# load per-stratum environment variable data
+		'"${envvarmap}"'
+	}
+	# get section
+	/^[ \t\r]*\[.*\][ \t\r]*$/ {
+		section=$0
+		sub(/^[ \t\r]*\[[ \t\r]*/, "", section)
+		sub(/[ \t\r]*\][ \t\r]*$/, "", section)
+		key = ""
+		next
+	}
+	# Skip lines that are not key-value pairs
+	!/=/ {
+		next
+	}
+	# get key and values
+	/=/ {
+		key = substr($0, 0, index($0, "=")-1)
+		gsub(/[ \t\r]*/, "", key)
+		values_string = substr($0, index($0, "=")+1)
+		values_len = split(values_string, n_values, ",")
+		for (i = 1; i <= values_len; i++) {
+			gsub(/[ \t\r]*/, "", n_values[i])
+		}
+	}
+	# get ordered list of strata
+	section == "cross" && key == "priority" {
+		# add priority strata first, in order
+		for (i = 1; i <= values_len; i++) {
+			# deref
+			if (n_values[i] in aliases) {
+				n_values[i] = aliases[n_values[i]]
+			}
+			# add to ordered list
+			if (n_values[i] in unordered_strata) {
+				n_strata[++strata_len] = n_values[i]
+				strata[n_values[i]] = n_values[i]
+			}
+		}
+		# init stratum should be highest unspecified priority
+		if ("init" in aliases && !(aliases["init"] in strata)) {
+			stratum=aliases["init"]
+			n_strata[++strata_len] = stratum
+			strata[stratum] = stratum
+		}
+		# rest of strata except bedrock
+		for (stratum in unordered_strata) {
+			if (stratum == "bedrock") {
+				continue
+			}
+			if (!(stratum in strata)) {
+				if (stratum in aliases) {
+					stratum = aliases[stratum]
+				}
+				n_strata[++strata_len] = stratum
+				strata[stratum] = stratum
+			}
+		}
+		# if not specified, bedrock stratum should be at end
+		if (!("bedrock" in strata)) {
+			n_strata[++strata_len] = "bedrock"
+			strata["bedrock"] = "bedrock"
+		}
+	}
+	# build target list
+	section ~ /^cross-/ {
+		filter = section
+		sub(/^cross-/, "", filter)
+		# add stratum-specific items first
+		for (i = 1; i <= values_len; i++) {
+			if (!index(n_values[i], ":")) {
+				continue
+			}
+
+			stratum = substr(n_values[i], 0, index(n_values[i],":")-1)
+			path = substr(n_values[i], index(n_values[i],":")+1)
+			if (stratum in aliases) {
+				stratum = aliases[stratum]
+			}
+			if (!(stratum in strata) && stratum != "local") {
+				continue
+			}
+
+			body = stratum":"path
+			sub(/\/.*$/, "", body)
+			suffix = stratum":"path
+			sub(/^[^$]*[$][^\/]*/, "", suffix)
+			if (body in envvarmap) {
+				split(envvarmap[body], a, ":")
+				for (k = 1; k in a; k++) {
+					a[k] = a[k]""suffix
+				}
+			} else {
+				split("", a, "")
+				a[1] = path
+			}
+
+			for (k = 1; k in a; k++) {
+				target = filter" /"key" "stratum":"a[k]
+				if (!(target in targets)) {
+					n_targets[++targets_len] = target
+					targets[target] = target
+				}
+			}
+		}
+
+		# add all-strata items in stratum order
+		for (i = 1; i <= strata_len; i++) {
+			for (j = 1; j <= values_len; j++) {
+				if (index(n_values[j], ":")) {
+					continue
+				}
+
+				body = n_strata[i]":"n_values[j]
+				sub(/\/.*$/, "", body)
+				suffix = n_strata[i]":"n_values[j]
+				sub(/^[^$]*[$][^\/]*/, "", suffix)
+				if (body in envvarmap) {
+					split(envvarmap[body], a, ":")
+					for (k = 1; k in a; k++) {
+						a[k] = a[k]""suffix
+					}
+				} else {
+					split("", a, "")
+					a[1] = n_values[j]
+				}
+
+				for (k = 1; k in a; k++) {
+					target = filter" /"key" "n_strata[i]":"a[k]
+					if (!(target in targets)) {
+						n_targets[++targets_len] =  target
+						targets[target] = target
+					}
+				}
+			}
+		}
+	}
+	# write new config
+	END {
+		# remove old configuration
+		print "clear" >> fscfg
+		fflush(fscfg)
+		# write new configuration
+		for (i = 1; i <= targets_len; i++) {
+			print "add "n_targets[i] >> fscfg
+			fflush(fscfg)
+		}
+		close(fscfg)
+		exit 0
+	}
+	'
+}
+
+# Remove a stratum's items from a crossfs mount.  This is preferable to a full
+# reconfiguration where available, as it is faster and it does not even
+# temporarily remove items we wish to retain.
+cfg_crossfs_rm_strata() {
+	mount="${1}"
+	stratum="${2}"
+
+	awk -v"stratum=${stratum}" \
+		-v"fscfg=${mount}/.bedrock-config-filesystem" \
+		-F'[ :]' '
+	BEGIN {
+		while ((getline < fscfg) > 0) {
+			if ($3 == stratum) {
+				lines[$0] = $0
+			}
+		}
+		close(fscfg)
+		for (line in lines) {
+			print "rm "line >> fscfg
+			fflush(fscfg)
+		}
+		close(fscfg)
+	}'
+}
+
+# Configure etcfs mount point per bedrock.conf configuration.
+cfg_etcfs() {
+	mount="${1}"
+
+	cfg_preparse | awk \
+		-v"fscfg=${mount}/.bedrock-config-filesystem" '
+	# get section
+	/^[ \t\r]*\[.*\][ \t\r]*$/ {
+		section=$0
+		sub(/^[ \t\r]*\[[ \t\r]*/, "", section)
+		sub(/[ \t\r]*\][ \t\r]*$/, "", section)
+		key = ""
+	}
+	# get key and values
+	/=/ {
+		key = substr($0, 0, index($0, "=")-1)
+		gsub(/[ \t\r]*/, "", key)
+		values_string = substr($0, index($0, "=")+1)
+		values_len = split(values_string, n_values, ",")
+		for (i = 1; i <= values_len; i++) {
+			gsub(/[ \t\r]*/, "", n_values[i])
+		}
+	}
+	# Skip lines that are not key-value pairs
+	!/=/ {
+		next
+	}
+	# build target list
+	section == "global" && key == "etc" {
+		for (i = 1; i <= values_len; i++) {
+			target = "global /"n_values[i]
+			n_targets[++targets_len] = target
+			targets[target] = target
+		}
+	}
+	section == "etc-inject" {
+		target = "override inject /"key" "n_values[1]
+		n_targets[++targets_len] = target
+		targets[target] = target
+		while (key ~ "/") {
+			sub("/[^/]*$", "", key)
+			if (key != "") {
+				target = "override directory /"key" x"
+				n_targets[++targets_len] = target
+				targets[target] = target
+			}
+		}
+	}
+	section == "etc-symlinks" {
+		target = "override symlink /"key" "n_values[1]
+		n_targets[++targets_len] = target
+		targets[target] = target
+		while (key ~ "/") {
+			sub("/[^/]*$", "", key)
+			if (key != "") {
+				target = "override directory /"key" x"
+				n_targets[++targets_len] = target
+				targets[target] = target
+			}
+		}
+	}
+	END {
+		# apply difference to config
+		while ((getline < fscfg) > 0) {
+			n_currents[++currents_len] = $0
+			currents[$0] = $0
+		}
+		close(fscfg)
+		for (i = 1; i <= currents_len; i++) {
+			if (!(n_currents[i] in targets)) {
+				$0=n_currents[i]
+				print "rm_"$1" "$3 >> fscfg
+				fflush(fscfg)
+			}
+		}
+		for (i = 1; i <= targets_len; i++) {
+			if (!(n_targets[i] in currents)) {
+				print "add_"n_targets[i] >> fscfg
+				fflush(fscfg)
+			}
+		}
+		close(fscfg)
+	}
+	'
+
+	# Injection content may be incorrect if injection files have changed.
+	# Check for this situation and, if so, instruct etcfs to update
+	# injections.
+	for key in $(cfg_keys "etc-inject"); do
+		value="$(cfg_value "etc-inject" "${key}")"
+		if ! [ -e "${mount}/${key}" ]; then
+			continue
+		fi
+		awk -v"RS=^$" -v"x=$(cat "${value}")" \
+			-v"cmd=add_override inject /${key} ${value}" \
+			-v"fscfg=${mount}/.bedrock-config-filesystem" '
+			index($0, x) == 0 {
+				print cmd >> fscfg
+				fflush(fscfg)
+				close(fscfg)
+			}
+		' "${mount}/${key}"
+	done
+}
+
+import_users_and_groups() {
+	passwd_file="${1}"
+	group_file="${2}"
+
+	if [ -r "${group_file}" ]; then
+		while read -r line; do
+			group="$(echo "${line}" | awk -F: '{print$1}')"
+			if ! awk -F: -v"group=${group}" '$1 == group {exit 1}' /etc/group; then
+				continue
+			fi
+
+			gid="$(echo "${line}" | awk -F: '{print$3}')"
+			if awk -F: -v"gid=${gid}" '$3 == gid {exit 1}' /etc/group; then
+				addgroup -g "${gid}" -S "${group}"
+			else
+				addgroup -S "${group}"
+			fi
+		done <"${group_file}"
+	fi
+
+	if [ -r "${passwd_file}" ]; then
+		while read -r line; do
+			user="$(echo "${line}" | awk -F: '{print$1}')"
+			if ! awk -F: -v"user=${user}" '$1 == user {exit 1}' /etc/passwd; then
+				continue
+			fi
+
+			uid="$(echo "${line}" | awk -F: '{print$3}')"
+			gid="$(echo "${line}" | awk -F: '{print$4}')"
+			group="$(awk -F: -v"gid=${gid}" '$3 == gid {print$1;exit}' "${group_file}")"
+			if [ -z "${group}" ]; then
+				group="nogroup"
+				if ! grep -q "^${group}:" /etc/group; then
+					addgroup -S "nogroup"
+				fi
+			fi
+			gecos="$(echo "${line}" | awk -F: '{print$5}')"
+			home="$(echo "${line}" | awk -F: '{print$6}')"
+			shell="/bedrock/cross/bin/$(basename "$(echo "${line}" | awk -F: '{print$7}')")"
+			if awk -F: -v"uid=${uid}" '$3 == uid {exit 1}' /etc/passwd; then
+				adduser -h "${home}" -g "${gecos}" -s "${shell}" -G "${group}" -S -D -H -u "${uid}" "${user}"
+			else
+				adduser -h "${home}" -g "${gecos}" -s "${shell}" -G "${group}" -S -D -H "${user}"
+			fi
+		done <"${passwd_file}"
+	fi
+
+	# We just imported users & groups, now let's add users to groups
+	if [ -r "${group_file}" ]; then
+		while read -r line; do
+			if [ -z "$(echo "${line}" | awk -F: '{print$4}')" ]; then
+				continue
+			fi
+			group="$(echo "${line}" | awk -F: '{print$1}')"
+			for user in $(echo "${line}" | cut -d: -f4- | sed 's/,/ /g'); do
+				if grep -q "^${user}:" /etc/passwd; then
+					addgroup "${user}" "${group}"
+				fi
+			done
+		done <"${group_file}"
+	fi
+}
+
+# Different distros have different /etc/ssl setups, and apparently neither
+# busybox wget nor curl will portably auto-detect certificate path.  Wrap curl
+# to do so.
+#
+# - If first argument is `-q`, runs in quiet mode
+# - If first argument is `-t`, times run
+# - After any flags first argument must be URL
+# - After any flags second argument may be "-" to print download to stdout
+# - After any flags second argument may be path to download file
+# - If no second argument downloads to current working directory with default name
+download() {
+	# follow redirects, error on 404
+	local quiet=""
+	local time=""
+	if [ "${1}" = "-q" ]; then
+		quiet="-s"
+		shift
+	elif [ "${1}" = "-t" ]; then
+		quiet="-s"
+		time="time"
+		shift
+	else
+		echo "Downloading ${1}" >&2
+	fi
+
+	certpath=""
+	for path in \
+		"/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem" \
+		"/etc/pki/tls/cacert.pem" \
+		"/etc/pki/tls/certs/ca-bundle.crt" \
+		"/etc/ssl/ca-bundle.pem" \
+		"/etc/ssl/cert.pem" \
+		"/etc/ssl/certs/ca-certificates.crt"; do
+		path="$(realpath "${path}" 2>/dev/null)" || continue
+		if stat -c "%U:%G:%a" "${path}" 2>/dev/null | grep -q "^root:root:.44$"; then
+			certpath="${path}"
+			break
+		fi
+	done
+	if [ -z "${certpath}" ]; then
+		abort "Unable to determine calling stratum certificate file"
+	fi
+
+	# word splitting is desired
+	# shellcheck disable=SC2086
+	case "${2:-}" in
+	"-") ${time} /bedrock/libexec/curl ${quiet} --location --fail --cacert "${certpath}" "${1}" ;;
+	"") ${time} /bedrock/libexec/curl ${quiet} --location --fail --cacert "${certpath}" -O "${1}" ;;
+	*) ${time} /bedrock/libexec/curl ${quiet} --location --fail --cacert "${certpath}" "${1}" >"${2}" ;;
+	esac
+}
+
+trap 'abort "Unexpected error occurred."' EXIT
+
+set -eu
+set -o pipefail
+umask 022
+
+# This can trip up software which does not expect it.
+unset CDPATH
+# Some software set TMPDIR to stratum-local locations which can break Bedrock
+# code.  Unset it.
+unset TMPDIR
+
+brl_color=true
+if ! [ -t 1 ]; then
+	brl_color=false
+elif [ -r /bedrock/etc/bedrock.conf ] &&
+	[ "$(cfg_value "miscellaneous" "color")" != "true" ]; then
+	brl_color=false
+fi
+
+if "${brl_color}"; then
+	export color_alert='\033[0;91m'             # light red
+	export color_priority='\033[1;37m\033[101m' # white on red
+	export color_warn='\033[0;93m'              # bright yellow
+	export color_okay='\033[0;32m'              # green
+	export color_strat='\033[0;36m'             # cyan
+	export color_disabled_strat='\033[0;34m'    # bold blue
+	export color_alias='\033[0;93m'             # bright yellow
+	export color_sub='\033[0;93m'               # bright yellow
+	export color_file='\033[0;32m'              # green
+	export color_cmd='\033[0;32m'               # green
+	export color_rcmd='\033[0;31m'              # red
+	export color_distro='\033[0;93m'            # yellow
+	export color_bedrock="${color_distro}"      # same as other distros
+	export color_logo='\033[1;37m'              # bold white
+	export color_glue='\033[1;37m'              # bold white
+	export color_link='\033[0;94m'              # bright blue
+	export color_term='\033[0;35m'              # magenta
+	export color_misc='\033[0;32m'              # green
+	export color_norm='\033[0m'
+else
+	export color_alert=''
+	export color_priority=''
+	export color_warn=''
+	export color_okay=''
+	export color_strat=''
+	export color_disabled_strat=''
+	export color_alias=''
+	export color_sub=''
+	export color_file=''
+	export color_cmd=''
+	export color_rcmd=''
+	export color_distro=''
+	export color_bedrock=''
+	export color_logo=''
+	export color_glue=''
+	export color_link=''
+	export color_term=''
+	export color_misc=''
+	export color_norm=''
+fi

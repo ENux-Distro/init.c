@@ -1,12 +1,20 @@
 /*
  * init.c - interactive menus
  *
- * Two menus:
- *   run_fallback_menu() - shown first, lets user escape to init.sh.bak
- *   run_menu()          - stratum/init selection with countdown
+ * Two menus, in boot order:
  *
- * Uses timerfd_create() + select() for the countdown — no `date` polling,
- * no usleep loop. All rendering via direct write() — no printf subprocesses.
+ *   run_enux_selector() — ENux Boot Manager.  Choice between continuing
+ *     with this C init (default, 5s timeout) and exec'ing the original
+ *     Bedrock shell init, which then owns the whole boot.  Runs before
+ *     any state is mutated so the handoff is always clean.
+ *
+ *   run_menu() — Bedrock init selection, behaviorally matching the shell's
+ *     get_init_choice(): candidates are bedrock.conf [init] paths resolved
+ *     inside every show_init stratum, the [init] default is preselected,
+ *     and an invalid default means wait-forever instead of countdown.
+ *
+ * All keyboard waiting and countdown ticking goes through asm_poll_read /
+ * asm_usleep — raw poll/read/nanosleep syscalls in asm_util.asm.
  */
 
 #include <stdio.h>
@@ -17,38 +25,22 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <termios.h>
-#include <dirent.h>
-#include <sys/select.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/wait.h>
-#include <sys/timerfd.h>
-#include <sys/mount.h>
-#include <stdint.h>
-#include <time.h>
 
 #include "init.h"
-
-/* Backup paths are defined in init.h:
- *   BEDROCK_INIT_BACKUP  = /bedrock/strata/bedrock/sbin/init.sh.bak
- *   BEDROCK_INIT_BIN_BAK = /bedrock/strata/bedrock/sbin/init.bin.bak
- */
+#include "bedrock_conf.h"
+#include "stratum.h"
 
 /* VT100 */
 #define VT_CLEAR        "\033[2J\033[H"
 #define VT_CURSOR_HIDE  "\033[?25l"
 #define VT_CURSOR_SHOW  "\033[?25h"
-#define VT_BOLD         "\033[1m"
-#define VT_DIM          "\033[2m"
-#define VT_RESET        "\033[0m"
-#define VT_GREEN        "\033[1;32m"
-#define VT_CYAN         "\033[1;36m"
-#define VT_YELLOW       "\033[1;33m"
-#define VT_RED          "\033[1;31m"
 
 static void w(const char *s)
 {
-    (void)write(STDOUT_FILENO, s, strlen(s));
+    asm_write_str(STDOUT_FILENO, s);
 }
 
 static void wf(const char *fmt, ...)
@@ -62,596 +54,516 @@ static void wf(const char *fmt, ...)
 }
 
 /* Logo */
+
 void print_logo(void)
 {
     char release[128] = "Bedrock Linux";
-    {
-        int fd = open("/bedrock/etc/bedrock-release", O_RDONLY);
-        if (fd >= 0) {
-            int n = (int)read(fd, release, sizeof(release) - 1);
-            if (n > 0) {
-                release[n] = '\0';
-                if (release[n-1] == '\n') release[n-1] = '\0';
-            }
-            close(fd);
+    int fd = open(BEDROCK_RELEASE, O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, release, sizeof(release) - 1);
+        if (n > 0) {
+            release[n] = '\0';
+            if (release[n - 1] == '\n')
+                release[n - 1] = '\0';
         }
+        close(fd);
     }
 
-    /*
-     * Bedrock Linux logo — original ASCII art from the project.
-     * Printed in bold white; the release string follows in cyan.
-     */
-    w("\n");
-    w(VT_BOLD);
+    w("\n" COL_BOLD);
+    w("__          __             __\n");
     w("\\ \\_________\\ \\____________\\ \\___\n");
     w(" \\  _ \\  _\\ _  \\  _\\ __ \\ __\\   /\n");
     w("  \\___/\\__/\\__/ \\_\\ \\___/\\__/\\_\\_\\\n");
-    w(VT_RESET);
-    w("  ");
-    w(VT_CYAN);
+    w(COL_RESET "  " COL_CYAN);
     w(release);
-    w(VT_RESET);
-    w("  |  init.c\n\n");
+    w(COL_RESET COL_DIM "  |  init.c" COL_RESET "\n\n");
 }
 
 /* Raw terminal helpers */
 
 static struct termios saved_termios;
-static int            raw_active = 0;
+static int            raw_active  = 0;
 static int            menu_tty_fd = -1;
 
-/* Try to get a usable TTY fd for keyboard input.
- * At PID 1, STDIN_FILENO is often /dev/null or a console without
- * proper termios support. Fall back to /dev/console or /dev/tty0. */
+/* At PID 1, stdin may not be a usable TTY; fall back to the console. */
 static int open_menu_tty(void)
 {
-    if (isatty(STDIN_FILENO))
-        return STDIN_FILENO;
+    if (menu_tty_fd >= 0)
+        return menu_tty_fd;
 
-    static const char *tty_paths[] = {
-        "/dev/console",
-        "/dev/tty0",
-        "/dev/tty1",
-        NULL
-    };
-
-    for (int i = 0; tty_paths[i]; i++) {
-        int fd = open(tty_paths[i], O_RDWR | O_NOCTTY);
-        if (fd >= 0 && isatty(fd))
-            return fd;
-        if (fd >= 0) close(fd);
+    if (isatty(STDIN_FILENO)) {
+        menu_tty_fd = STDIN_FILENO;
+        return menu_tty_fd;
     }
 
-    return STDIN_FILENO;
+    static const char *tty_paths[] = {
+        "/dev/console", "/dev/tty0", "/dev/tty1", NULL
+    };
+    for (int i = 0; tty_paths[i]; i++) {
+        int fd = open(tty_paths[i], O_RDWR | O_NOCTTY);
+        if (fd >= 0 && isatty(fd)) {
+            menu_tty_fd = fd;
+            return fd;
+        }
+        if (fd >= 0)
+            close(fd);
+    }
+
+    menu_tty_fd = STDIN_FILENO;
+    return menu_tty_fd;
 }
 
 static void enter_raw(void)
 {
-    menu_tty_fd = open_menu_tty();
-    if (tcgetattr(menu_tty_fd, &saved_termios) < 0) {
-        menu_tty_fd = STDIN_FILENO;
+    int fd = open_menu_tty();
+    if (tcgetattr(fd, &saved_termios) < 0)
         return;
-    }
     struct termios raw = saved_termios;
     raw.c_lflag &= ~(unsigned)(ICANON | ECHO);
     raw.c_cc[VMIN]  = 1;
     raw.c_cc[VTIME] = 0;
-    tcsetattr(menu_tty_fd, TCSANOW, &raw);
+    if (tcsetattr(fd, TCSANOW, &raw) < 0)
+        return;
     w(VT_CURSOR_HIDE);
     raw_active = 1;
 }
 
 static void leave_raw(void)
 {
-    if (!raw_active) return;
-    tcsetattr(menu_tty_fd, TCSANOW, &saved_termios);
+    if (!raw_active)
+        return;
+    if (tcsetattr(menu_tty_fd, TCSANOW, &saved_termios) < 0)
+        warn("tcsetattr restore: %s", strerror(errno));
     w(VT_CURSOR_SHOW);
     raw_active = 0;
-    if (menu_tty_fd != STDIN_FILENO) {
-        close(menu_tty_fd);
-        menu_tty_fd = STDIN_FILENO;
-    }
 }
 
-/* Fallback menu */
+/* Read one key with a millisecond timeout via the asm poll loop.
+ * For ESC, consume a "[X" continuation if one arrives promptly and map
+ * arrow keys to 'A'/'B' with the high bit set. */
+#define KEY_UP   0x141
+#define KEY_DOWN 0x142
 
-/*
- * run_fallback_menu()
- *
- * Shown immediately after the logo, before any stratum scanning.
- * Gives the user a 5-second window to escape to the original Bedrock
- * Linux init if something is broken with the C init.
- *
- * Tries raw-mode keyboard input; falls back to cooked line input
- * if the terminal doesn't support raw mode (common at PID 1 boot).
- *
- * Option 1 (default on timeout): Use fallback Bedrock Linux init.
- * Option 2:                      Continue with init.c.
- *
- * Fallback candidates (checked in order):
- *   BEDROCK_INIT_BACKUP  → init.sh.bak  (shebang backup)
- *   BEDROCK_INIT_BIN_BAK → init.bin.bak (binary backup)
- *   /sbin/init           → system fallback
- */
-void run_fallback_menu(char **argv)
+static int read_key(int timeout_ms)
 {
-    /* Fallback init is always /sbin/init (the Makefile copies the
-     * original Bedrock shell init there during install) */
-    static const char *fallback_cands[] = {
-        "/sbin/init",
-        NULL
-    };
+    int fd = open_menu_tty();
+    int c  = asm_poll_read(fd, timeout_ms);
+    if (c != 0x1b)
+        return c;
 
-    int backup_ok = 0;
-    const char *backup_path = NULL;
+    int c1 = asm_poll_read(fd, 50);
+    if (c1 != '[')
+        return 0x1b;
+    int c2 = asm_poll_read(fd, 50);
+    if (c2 == 'A')
+        return KEY_UP;
+    if (c2 == 'B')
+        return KEY_DOWN;
+    return 0x1b;
+}
 
-    for (int i = 0; fallback_cands[i]; i++) {
-        if (access(fallback_cands[i], X_OK) == 0) {
-            backup_ok = 1;
-            backup_path = fallback_cands[i];
+/* ENux dual-boot selector */
+
+static void render_selector(int sel, int remaining, int bedrock_ok)
+{
+    w(VT_CLEAR);
+    print_logo();
+    w(COL_BOLD "  ENux Boot Manager\n" COL_RESET);
+    if (remaining > 0)
+        wf(COL_DIM "  Booting default in %d second%s\n" COL_RESET,
+           remaining, remaining == 1 ? "" : "s");
+    w("\n");
+
+    wf("  %s 1. ENux init (init.c)  " COL_DIM "[default]" COL_RESET "\n",
+       sel == 0 ? COL_GREEN ">" COL_RESET : " ");
+    if (bedrock_ok)
+        wf("  %s 2. Bedrock Linux init  " COL_DIM "(%s)" COL_RESET "\n",
+           sel == 1 ? COL_GREEN ">" COL_RESET : " ", BEDROCK_SHELL_INIT);
+    else
+        w("    2. " COL_DIM "Bedrock Linux init (unavailable)"
+          COL_RESET "\n");
+
+    w("\n" COL_DIM "  [1/2] choose   [up/down] move   [Enter] confirm\n"
+      COL_RESET);
+}
+
+void run_enux_selector(char **argv)
+{
+    int bedrock_ok = (access(BEDROCK_SHELL_INIT, X_OK) == 0) &&
+                     !is_self(BEDROCK_SHELL_INIT);
+
+    enter_raw();
+
+    int sel       = 0;
+    int remaining = ENUX_SELECTOR_TIMEOUT;
+    int done      = 0;
+
+    render_selector(sel, remaining, bedrock_ok);
+
+    while (!done) {
+        /* One countdown tick: wait up to 1s for a key. */
+        int c = read_key(1000);
+
+        switch (c) {
+        case -2: /* input error — fall through to timeout behavior */
+        case -1: /* tick */
+            if (--remaining <= 0)
+                done = 1;
+            else
+                render_selector(sel, remaining, bedrock_ok);
+            if (c == -2 && !done) {
+                /* no usable input; don't spin on a broken fd */
+                asm_usleep(1000 * 1000);
+            }
+            break;
+        case '1':
+            sel  = 0;
+            done = 1;
+            break;
+        case '2':
+            if (bedrock_ok) {
+                sel  = 1;
+                done = 1;
+            }
+            break;
+        case KEY_UP:
+            sel       = 0;
+            remaining = ENUX_SELECTOR_TIMEOUT;
+            render_selector(sel, remaining, bedrock_ok);
+            break;
+        case KEY_DOWN:
+            if (bedrock_ok)
+                sel = 1;
+            remaining = ENUX_SELECTOR_TIMEOUT;
+            render_selector(sel, remaining, bedrock_ok);
+            break;
+        case '\n':
+        case '\r':
+            done = 1;
+            break;
+        default:
             break;
         }
     }
 
-    const int FALLBACK_TIMEOUT = 5;
-
-    int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
-    if (tfd >= 0) {
-        struct itimerspec its = {
-            .it_interval = { .tv_sec = 1, .tv_nsec = 0 },
-            .it_value    = { .tv_sec = 1, .tv_nsec = 0 },
-        };
-        timerfd_settime(tfd, 0, &its, NULL);
-    }
-
-    int sel       = 0;              /* default highlight = fallback */
-    int remaining = FALLBACK_TIMEOUT;
-
-    enter_raw();
-    int have_raw = raw_active;
-
-    int done = 0;
-    while (!done) {
-        w(VT_CLEAR);
-        print_logo();
-        w(VT_BOLD "  Boot options\n" VT_RESET);
-        if (remaining > 0 && have_raw)
-            wf(VT_DIM "  Defaulting to fallback in %d second%s\n" VT_RESET,
-               remaining, remaining == 1 ? "" : "s");
-        w("\n");
-
-        if (backup_ok) {
-            wf("%s  1.  Use " VT_YELLOW "fallback Bedrock Linux init" VT_RESET
-               VT_DIM " (%s)" VT_RESET "\n",
-               sel == 0 ? VT_GREEN "▶" VT_RESET : " ",
-               backup_path);
-        } else {
-            wf("   1.  " VT_DIM "Fallback unavailable" VT_RESET
-               " (no backup found)\n");
-        }
-
-        wf("%s  2.  Continue with " VT_BOLD "init.c" VT_RESET "\n",
-           sel == 1 ? VT_GREEN "▶" VT_RESET : " ");
-
-        w("\n");
-        if (have_raw) {
-            w(VT_DIM "  [↑/↓] navigate   [Enter] select   [1/2] quick choice\n" VT_RESET);
-        } else {
-            w(VT_BOLD "  Enter 1 or 2 and press Enter: " VT_RESET);
-        }
-
-        /* Use the TTY fd that enter_raw opened, or STDIN_FILENO */
-        int input_fd = (menu_tty_fd >= 0 && menu_tty_fd != STDIN_FILENO)
-                       ? menu_tty_fd : STDIN_FILENO;
-
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(input_fd, &rfds);
-        int maxfd = input_fd;
-        if (tfd >= 0) { FD_SET(tfd, &rfds); if (tfd > maxfd) maxfd = tfd; }
-
-        /* Always use a timeout so we don't hang forever */
-        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
-        int r = select(maxfd + 1, &rfds, NULL, NULL,
-                       (tfd >= 0 || have_raw) ? NULL : &tv);
-        if (r < 0 && errno == EINTR) continue;
-
-        if (tfd >= 0 && FD_ISSET(tfd, &rfds)) {
-            uint64_t exp;
-            (void)read(tfd, &exp, sizeof(exp));
-            remaining -= (int)exp;
-            if (remaining <= 0) {
-                sel = backup_ok ? 0 : 1;
-                done = 1;
-                break;
-            }
-        }
-
-        /* Cooked mode fallback: no timerfd, no raw — poll every 1s */
-        if (!have_raw && tfd < 0 && r == 0) {
-            remaining--;
-            if (remaining <= 0) {
-                sel = backup_ok ? 0 : 1;
-                done = 1;
-                break;
-            }
-        }
-
-        if (FD_ISSET(input_fd, &rfds)) {
-            if (have_raw) {
-                /* Raw mode: single char reads */
-                unsigned char ch;
-                if (read(input_fd, &ch, 1) != 1) break;
-
-                if (ch == 0x1b) {
-                    struct timeval tv2 = { .tv_sec = 0, .tv_usec = 50000 };
-                    fd_set peek; FD_ZERO(&peek); FD_SET(input_fd, &peek);
-                    if (select(input_fd + 1, &peek, NULL, NULL, &tv2) > 0) {
-                        unsigned char seq[2];
-                        (void)read(input_fd, seq, 2);
-                        if (seq[0] == '[') {
-                            if (seq[1] == 'A' && sel > 0) sel--;
-                            else if (seq[1] == 'B' && sel < 1) sel++;
-                        }
-                    }
-                    remaining = FALLBACK_TIMEOUT;
-                } else if (ch == '1' && backup_ok) {
-                    sel = 0; done = 1;
-                } else if (ch == '2') {
-                    sel = 1; done = 1;
-                } else if (ch == '\n' || ch == '\r') {
-                    done = 1;
-                } else if ((ch == 'f' || ch == 'F') && backup_ok) {
-                    sel = 0; done = 1;
-                } else if (ch == 'c' || ch == 'C') {
-                    sel = 1; done = 1;
-                }
-            } else {
-                /* Cooked mode: read a line */
-                char line[16];
-                ssize_t n = read(input_fd, line, sizeof(line) - 1);
-                if (n <= 0) { /* maybe EOF, poll again */ continue; }
-                line[n] = '\0';
-                if (line[0] == '1' && backup_ok) {
-                    sel = 0; done = 1;
-                } else if (line[0] == '2') {
-                    sel = 1; done = 1;
-                }
-            }
-        }
-    }
-
     leave_raw();
-    if (tfd >= 0) close(tfd);
 
-    if (sel == 0 && backup_ok) {
-        notice("Falling back to %s", backup_path);
-        struct stat st;
-        if (stat(backup_path, &st) < 0)
-            panic("Fallback init %s not found: %s", backup_path, strerror(errno));
-        if (!(st.st_mode & S_IXUSR))
-            panic("Fallback init %s is not executable", backup_path);
-        if (S_ISLNK(st.st_mode)) {
-            char target[256];
-            ssize_t len = readlink(backup_path, target, sizeof(target) - 1);
-            if (len >= 0) target[len] = '\0';
-            notice("  (%s is a symlink to %s)", backup_path, len > 0 ? target : "?");
-        }
-        char *fb_argv[] = { (char *)backup_path, NULL };
-        execv(backup_path, fb_argv);
-        panic("exec of fallback init failed: %s", strerror(errno));
+    if (sel == 1 && bedrock_ok) {
+        w(VT_CLEAR);
+        notice("Handing off to the Bedrock Linux init");
+        argv[0] = (char *)BEDROCK_SHELL_INIT;
+        execv(BEDROCK_SHELL_INIT, argv);
+        /* Exec failed; the C init is still a fully capable PID 1. */
+        warn("exec %s: %s — continuing with init.c",
+             BEDROCK_SHELL_INIT, strerror(errno));
     }
 
-    /* sel == 1: continue with init.c */
     w(VT_CLEAR);
     print_logo();
 }
 
-/* Init path resolution */
+/* wait_for_keyboard */
 
-/*
- * resolve_init_path()
- *
- * fork → chroot into stratum → busybox realpath → read pipe.
- * Replaces the shell's chroot + realpath subprocess chain.
- */
-static int resolve_init_path(const char *stratum_root,
-                              const char *cmd,
-                              char *out, size_t outsz)
+static int keyboard_is_present(void)
 {
-    char sproc[MAX_PATH_LEN];
-    snprintf(sproc, sizeof(sproc), "%s/proc", stratum_root);
-    mkdir(sproc, 0755);
-    int mounted = (mount("proc", sproc, "proc", 0, NULL) == 0);
-
-    int pipefd[2];
-    if (pipe(pipefd) < 0) {
-        if (mounted) umount(sproc);
-        return -1;
-    }
-
-    pid_t pid = fork();
-    if (pid == 0) {
-        close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        close(pipefd[1]);
-
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
-
-        if (chroot(stratum_root) < 0) _exit(1);
-        if (chdir("/") < 0) _exit(1);
-
-        execv("/proc/1/root/bedrock/libexec/busybox",
-              (char *[]){ "busybox", "realpath", (char *)cmd, NULL });
-        _exit(1);
-    }
-
-    close(pipefd[1]);
-
-    int ret = -1;
-    if (pid > 0) {
-        ssize_t n = read(pipefd[0], out, outsz - 1);
-        if (n > 0) {
-            out[n] = '\0';
-            if (out[n-1] == '\n') out[n-1] = '\0';
-            ret = 0;
-        }
-        waitpid(pid, NULL, 0);
-    }
-    close(pipefd[0]);
-
-    if (mounted) umount(sproc);
-    return ret;
+    if (access(BEDROCK_ROOT "/libexec/keyboard_is_present", X_OK) != 0)
+        return 1; /* helper missing: assume present, like a 0.7.7 system */
+    return run_cmd((char *[]){
+        BEDROCK_ROOT "/libexec/keyboard_is_present", NULL }, 1) == 0;
 }
 
-/* Init option list */
+/* Slow-to-initialize USB keyboards confused users who could not type in
+ * the menu.  Load configured input modules, then vocally wait up to
+ * `timeout` seconds for a keyboard, polling every quarter second. */
+static void wait_for_keyboard(int timeout)
+{
+    char mods[8][MAX_PATH_LEN];
+    int  nm = cfg_values("init", "modules", mods, 8);
+    for (int i = 0; i < nm; i++) {
+        if (access("/sbin/modprobe", X_OK) == 0)
+            run_cmd((char *[]){ "/sbin/modprobe", mods[i], NULL }, 1);
+    }
+
+    if (keyboard_is_present())
+        return;
+
+    wf("Waiting up to %d seconds for keyboard initialization...", timeout);
+
+    struct timespec start, now;
+    if (clock_gettime(CLOCK_MONOTONIC, &start) == 0) {
+        for (;;) {
+            if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+                break;
+            if (now.tv_sec - start.tv_sec >= timeout)
+                break;
+            if (keyboard_is_present())
+                break;
+            asm_usleep(250 * 1000);
+        }
+    }
+
+    w("\r\033[K");
+    if (!keyboard_is_present())
+        notice(COL_YELLOW "WARNING: unable to detect keyboard" COL_RESET);
+}
+
+/* Init option discovery */
 
 typedef struct {
     char stratum[MAX_NAME_LEN];
-    char cmd[MAX_PATH_LEN];
-    char resolved[MAX_PATH_LEN];
-    char full_path[MAX_PATH_LEN];
+    char cmd[MAX_PATH_LEN];       /* as configured, e.g. /sbin/init   */
+    char link[MAX_PATH_LEN];      /* resolved inside the stratum      */
+    char full[MAX_PATH_LEN];      /* pre-pivot path for validation    */
     int  is_default;
 } InitOption;
 
 static InitOption options[MAX_STRATA * MAX_INIT_PATHS];
 static int        n_options = 0;
 
-static const char *known_init_paths[] = {
-    "/sbin/init",
-    "/bin/init",
-    "/usr/sbin/init",
-    "/usr/bin/init",
-    "/lib/systemd/systemd",
-    "/usr/lib/systemd/systemd",
-    NULL
-};
+static int option_cmp(const void *a, const void *b)
+{
+    const InitOption *x = a, *y = b;
+    int r = asm_strcmp(x->stratum, y->stratum);
+    if (r != 0)
+        return r;
+    return asm_strcmp(x->cmd, y->cmd);
+}
 
+/*
+ * Mirrors list_init_options(): every show_init stratum (bedrock excluded;
+ * aliases never appear since scan_strata skips symlinks) crossed with
+ * every [init] paths entry, resolved inside the stratum, executable
+ * regular files only.  Duplicate resolved paths within a stratum keep the
+ * first hit, matching the upstream awk's effective behavior.
+ */
 static void populate_options(InitState *st)
 {
+    char paths[MAX_INIT_PATHS][MAX_PATH_LEN];
+    int  np = cfg_values("init", "paths", paths, MAX_INIT_PATHS);
+
+    if (np == 0) {
+        /* No configured paths (broken/missing bedrock.conf).  Probe the
+         * conventional locations rather than presenting nothing. */
+        static const char *fallback[] = {
+            "/sbin/init", "/lib/systemd/systemd",
+            "/usr/lib/systemd/systemd", NULL
+        };
+        for (int i = 0; fallback[i] && np < MAX_INIT_PATHS; i++)
+            snprintf(paths[np++], MAX_PATH_LEN, "%s", fallback[i]);
+        warn("no [init] paths in %s; using built-in defaults",
+             BEDROCK_CONF);
+    }
+
     n_options = 0;
 
     for (int i = 0; i < st->n_strata; i++) {
         Stratum *s = &st->strata[i];
 
-        if (!s->show_init) continue;
-        if (asm_strcmp(s->name, "bedrock") == 0) continue;
-        if (asm_strcmp(s->name, "hijacked") == 0) continue;
+        if (asm_strcmp(s->name, "bedrock") == 0)
+            continue;
+        if (!s->show_init)
+            continue;
 
-        for (int j = 0; known_init_paths[j]; j++) {
-            const char *cmd = known_init_paths[j];
-
-            char resolved[MAX_PATH_LEN] = {0};
-            if (resolve_init_path(s->root, cmd, resolved, sizeof(resolved)) < 0)
+        for (int j = 0; j < np; j++) {
+            char link[MAX_PATH_LEN];
+            if (stratum_realpath(s->root, paths[j],
+                                 link, sizeof(link)) < 0)
                 continue;
 
             char full[MAX_PATH_LEN];
-            snprintf(full, sizeof(full), "%s%s", s->root, resolved);
+            if (snprintf(full, sizeof(full), "%s%s", s->root, link)
+                    >= (int)sizeof(full))
+                continue;
 
-            struct stat st_buf;
-            if (stat(full, &st_buf) < 0) continue;
-            if (!(st_buf.st_mode & S_IXUSR)) continue;
+            struct stat sb;
+            if (stat(full, &sb) < 0)
+                continue;
+            if (!S_ISREG(sb.st_mode) || !(sb.st_mode & 0111))
+                continue;
 
-            /* De-duplicate by resolved full path */
             int dup = 0;
             for (int k = 0; k < n_options; k++) {
-                if (asm_strcmp(options[k].full_path, full) == 0) {
-                    dup = 1; break;
+                if (asm_strcmp(options[k].full, full) == 0) {
+                    dup = 1;
+                    break;
                 }
             }
-            if (dup) continue;
+            if (dup)
+                continue;
+            if (n_options >= (int)(sizeof(options) / sizeof(options[0])))
+                return;
 
-            InitOption *opt = &options[n_options++];
-            strncpy(opt->stratum,   s->name,  MAX_NAME_LEN - 1);
-            opt->stratum[MAX_NAME_LEN - 1] = '\0';
-            strncpy(opt->cmd,       cmd,       MAX_PATH_LEN - 1);
-            opt->cmd[MAX_PATH_LEN - 1] = '\0';
-            strncpy(opt->resolved,  resolved,  MAX_PATH_LEN - 1);
-            opt->resolved[MAX_PATH_LEN - 1] = '\0';
-            strncpy(opt->full_path, full,      MAX_PATH_LEN - 1);
-            opt->full_path[MAX_PATH_LEN - 1] = '\0';
-            opt->is_default = 0;
-
-            if (n_options >= (int)(sizeof(options)/sizeof(options[0])))
-                goto done_scanning;
+            InitOption *o = &options[n_options];
+            if (joincat(o->stratum, sizeof(o->stratum), s->name,
+                        NULL) < 0 ||
+                joincat(o->cmd, sizeof(o->cmd), paths[j], NULL) < 0 ||
+                joincat(o->link, sizeof(o->link), link, NULL) < 0 ||
+                joincat(o->full, sizeof(o->full), full, NULL) < 0)
+                continue;
+            o->is_default = 0;
+            n_options++;
         }
     }
-done_scanning:;
 
-    /* Mark the configured default */
-    if (st->default_tuple[0]) {
-        char tmp[MAX_PATH_LEN];
-        strncpy(tmp, st->default_tuple, MAX_PATH_LEN - 1);
-        tmp[MAX_PATH_LEN - 1] = '\0';
-        char *colon = strchr(tmp, ':');
-        if (colon) {
-            *colon = '\0';
-            for (int i = 0; i < n_options; i++) {
-                if (asm_strcmp(options[i].stratum, tmp) == 0 &&
-                    asm_strcmp(options[i].cmd, colon + 1) == 0) {
-                    options[i].is_default = 1;
-                }
-            }
+    qsort(options, (size_t)n_options, sizeof(options[0]), option_cmp);
+
+    /* Star the configured default by resolved path, like the shell. */
+    if (st->def_path[0]) {
+        for (int i = 0; i < n_options; i++) {
+            if (asm_strcmp(options[i].full, st->def_path) == 0)
+                options[i].is_default = 1;
         }
     }
 }
 
-/* Init selection menu rendering */
+/* Init selection menu */
 
-static void render_menu(int highlight, int remaining_secs)
+static void render_menu(InitState *st, int highlight, int remaining)
 {
     w(VT_CLEAR);
     print_logo();
 
-    w(VT_BOLD "  Select init\n" VT_RESET);
-    if (remaining_secs > 0) {
-        wf(VT_DIM "  Auto-selecting in %d second%s"
-           "  (configure: " BEDROCK_CONF " [init])\n" VT_RESET,
-           remaining_secs, remaining_secs == 1 ? "" : "s");
-    }
+    w(COL_BOLD "  Select init for this session\n" COL_RESET);
+    w(COL_DIM "  Configure default and timeout: " BEDROCK_CONF
+      " [init]\n" COL_RESET);
+    if (remaining > 0)
+        wf(COL_DIM "  Selecting default in %d second%s\n" COL_RESET,
+           remaining, remaining == 1 ? "" : "s");
     w("\n");
 
     for (int i = 0; i < n_options; i++) {
         InitOption *o = &options[i];
-        const char *star = o->is_default ? VT_YELLOW "*" VT_RESET : " ";
-        const char *sel  = (i == highlight) ? VT_GREEN "▶ " VT_RESET : "  ";
-
-        wf("%s%s %s%2d.%s  %s%s%s:%s%s%s\n",
-           star, sel,
-           VT_DIM, i + 1, VT_RESET,
-           VT_GREEN, o->stratum, VT_RESET,
-           VT_CYAN,  o->cmd,    VT_RESET);
+        wf("%s%s" COL_DIM "%2d." COL_RESET " " COL_GREEN "%s" COL_RESET
+           ":" COL_CYAN "%s" COL_RESET,
+           o->is_default ? COL_YELLOW "*" COL_RESET : " ",
+           (i == highlight) ? COL_GREEN " > " COL_RESET : "   ",
+           i + 1, o->stratum, o->cmd);
+        if (asm_strcmp(o->cmd, o->link) != 0)
+            wf(COL_DIM " -> %s" COL_RESET, o->link);
+        w("\n");
     }
 
-    w("\n");
-    w(VT_DIM "  [↑/↓] navigate   [Enter] select   [0-9] jump\n" VT_RESET);
+    w("\n" COL_DIM "  [up/down] move   [1-9] jump   [Enter] select\n"
+      COL_RESET);
+    (void)st;
 }
 
 /*
  * run_menu()
  *
- * Replaces the shell's get_init_choice() + pretty_print_options().
- * Returns the index into st->strata for the chosen init.
+ * Returns the chosen stratum's index in st->strata and sets st->init_cmd
+ * to the *configured* command (e.g. /sbin/init) — the path is exec'd
+ * post-pivot where the stratum is the root, exactly like the shell.
+ * Returns -1 if nothing valid was chosen.
  */
 int run_menu(InitState *st)
 {
-    notice("Scanning init options...");
+    wait_for_keyboard(st->timeout > 0 ? st->timeout : 0);
+
     populate_options(st);
 
-    if (n_options == 0)
-        panic("No init options found in any stratum");
+    int have_default = (st->def_path[0] != '\0');
 
-    /* Default highlight */
+    if (n_options == 0 && !have_default) {
+        warn("no init options found in any stratum");
+        return -1;
+    }
+
     int highlight = 0;
     for (int i = 0; i < n_options; i++) {
-        if (options[i].is_default) { highlight = i; break; }
-    }
-
-    /* Zero timeout with a valid default: skip the menu */
-    if (st->timeout == 0 && options[highlight].is_default)
-        goto selected;
-
-    /* timerfd countdown */
-    int tfd = -1;
-    int remaining = st->timeout;
-
-    if (remaining > 0) {
-        tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
-        if (tfd >= 0) {
-            struct itimerspec its = {
-                .it_interval = { .tv_sec = 1, .tv_nsec = 0 },
-                .it_value    = { .tv_sec = 1, .tv_nsec = 0 },
-            };
-            timerfd_settime(tfd, 0, &its, NULL);
+        if (options[i].is_default) {
+            highlight = i;
+            break;
         }
     }
 
-    enter_raw();
-    render_menu(highlight, remaining);
+    int chosen_default = 0;
 
-    char num_buf[8] = {0};
-    int  num_len    = 0;
-    int  done       = 0;
+    /* timeout 0 + valid default: boot it without showing the menu. */
+    if (st->timeout == 0 && have_default) {
+        chosen_default = 1;
+    } else {
+        /* No valid default means wait forever (shell sets timeout -1). */
+        int remaining = have_default ? st->timeout : -1;
 
-    while (!done) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(STDIN_FILENO, &rfds);
-        int maxfd = STDIN_FILENO;
-        if (tfd >= 0) { FD_SET(tfd, &rfds); if (tfd > maxfd) maxfd = tfd; }
+        enter_raw();
+        render_menu(st, highlight, remaining);
 
-        int r = select(maxfd + 1, &rfds, NULL, NULL, NULL);
-        if (r < 0 && errno == EINTR) continue;
+        int done = 0;
+        while (!done) {
+            int c = read_key(remaining > 0 ? 1000 : -1);
 
-        if (tfd >= 0 && FD_ISSET(tfd, &rfds)) {
-            uint64_t exp;
-            (void)read(tfd, &exp, sizeof(exp));
-            remaining -= (int)exp;
-            if (remaining <= 0 && options[highlight].is_default) {
-                done = 1;
+            switch (c) {
+            case -1: /* tick */
+                if (remaining > 0 && --remaining <= 0) {
+                    chosen_default = 1;
+                    done = 1;
+                } else {
+                    render_menu(st, highlight, remaining);
+                }
+                break;
+            case -2: /* broken input: only the default can save us */
+                if (have_default) {
+                    chosen_default = 1;
+                    done = 1;
+                } else {
+                    asm_usleep(1000 * 1000);
+                }
+                break;
+            case KEY_UP:
+                if (highlight > 0)
+                    highlight--;
+                remaining = have_default ? st->timeout : -1;
+                render_menu(st, highlight, remaining);
+                break;
+            case KEY_DOWN:
+                if (highlight < n_options - 1)
+                    highlight++;
+                remaining = have_default ? st->timeout : -1;
+                render_menu(st, highlight, remaining);
+                break;
+            case '\n':
+            case '\r':
+                if (n_options > 0)
+                    done = 1;
+                break;
+            case '0':
+                if (have_default) {
+                    chosen_default = 1;
+                    done = 1;
+                }
+                break;
+            default:
+                if (c > '0' && c <= '9' && (c - '1') < n_options) {
+                    highlight = c - '1';
+                    remaining = have_default ? st->timeout : -1;
+                    render_menu(st, highlight, remaining);
+                }
                 break;
             }
-            render_menu(highlight, remaining > 0 ? remaining : 0);
         }
 
-        if (FD_ISSET(STDIN_FILENO, &rfds)) {
-            unsigned char ch;
-            if (read(STDIN_FILENO, &ch, 1) != 1) break;
-
-            if (ch == 0x1b) {
-                struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
-                fd_set peek; FD_ZERO(&peek); FD_SET(STDIN_FILENO, &peek);
-                if (select(STDIN_FILENO+1, &peek, NULL, NULL, &tv) > 0) {
-                    unsigned char seq[2];
-                    (void)read(STDIN_FILENO, seq, 2);
-                    if (seq[0] == '[') {
-                        if      (seq[1] == 'A' && highlight > 0)
-                            highlight--;
-                        else if (seq[1] == 'B' && highlight < n_options - 1)
-                            highlight++;
-                    }
-                }
-                remaining = st->timeout;
-                num_len   = 0;
-            } else if (ch == '\n' || ch == '\r') {
-                if (num_len > 0) {
-                    int n = atoi(num_buf);
-                    if (n >= 1 && n <= n_options)
-                        highlight = n - 1;
-                    num_len = 0;
-                    asm_memzero(num_buf, sizeof(num_buf));
-                }
-                done = 1;
-            } else if (ch >= '0' && ch <= '9') {
-                if (num_len < (int)sizeof(num_buf) - 1) {
-                    num_buf[num_len++] = (char)ch;
-                    num_buf[num_len]   = '\0';
-                    remaining = st->timeout;
-                }
-            }
-
-            if (!done) render_menu(highlight, remaining > 0 ? remaining : 0);
-        }
+        leave_raw();
     }
 
-    leave_raw();
-    if (tfd >= 0) close(tfd);
+    const char *want_stratum;
+    const char *want_cmd;
 
-selected:;
-    InitOption *chosen = &options[highlight];
+    if (chosen_default) {
+        want_stratum = st->def_stratum;
+        want_cmd     = st->def_cmd;
+    } else {
+        want_stratum = options[highlight].stratum;
+        want_cmd     = options[highlight].cmd;
+    }
 
     for (int i = 0; i < st->n_strata; i++) {
-        if (asm_strcmp(st->strata[i].name, chosen->stratum) == 0) {
-            strncpy(st->strata[i].init_cmd,  chosen->cmd,
-                    MAX_PATH_LEN - 1);
-            strncpy(st->strata[i].init_path, chosen->full_path,
-                    MAX_PATH_LEN - 1);
-            strncpy(st->init_cmd, chosen->resolved, MAX_PATH_LEN - 1);
-            st->init_cmd[MAX_PATH_LEN - 1] = '\0';
+        if (asm_strcmp(st->strata[i].name, want_stratum) == 0) {
+            snprintf(st->init_cmd, sizeof(st->init_cmd), "%s", want_cmd);
             return i;
         }
     }
 
+    warn("chosen stratum '%s' not found", want_stratum);
     return -1;
 }

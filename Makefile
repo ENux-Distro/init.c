@@ -3,228 +3,193 @@
 # Produces a statically linked ELF64 binary: build/init
 #
 # Build targets:
-#   make          → build/init (release, -O2, stripped)
-#   make debug    → build/init.debug (unstripped, -g, ASan)
-#   make clean    → remove build artefacts
-#   make install  → copy to /bedrock/libexec/enux-init (needs root)
-#   make check    → run basic smoke tests
+#   make            → build/init (release, -O2, stripped)
+#   make DEBUG=1    → build/init.debug (unstripped, -g3, ASan/UBSan)
+#   make debug      → alias for DEBUG=1
+#   make check      → basic smoke tests on the binary
+#   make install    → install to /bedrock/strata/bedrock/sbin/enux-init
+#                     (never touches the original Bedrock init)
+#   make clean      → remove build artefacts
 #
-# Requirements:
-#   gcc   (or clang — see CC override below)
-#   nasm  (for the .asm file)
-#   ld    (binutils)
+# Requirements: gcc (or clang), nasm, binutils.
 
-# Toolchain
 CC      ?= gcc
 NASM    ?= nasm
-LD      ?= ld
 STRIP   ?= strip
 INSTALL ?= install
-
-# Dirs
 
 SRCDIR   := src
 ASMDIR   := asm
 INCDIR   := include
+ifeq ($(DEBUG),1)
+BUILDDIR := build/debug
+else
 BUILDDIR := build
-
-# Sources
+endif
 
 C_SRCS := \
-	$(SRCDIR)/main.c    \
-	$(SRCDIR)/env.c     \
-	$(SRCDIR)/mount.c   \
-	$(SRCDIR)/stratum.c \
-	$(SRCDIR)/menu.c    \
-	$(SRCDIR)/conf.c    \
+	$(SRCDIR)/main.c         \
+	$(SRCDIR)/env.c          \
+	$(SRCDIR)/mount.c        \
+	$(SRCDIR)/stratum.c      \
+	$(SRCDIR)/menu.c         \
+	$(SRCDIR)/hijack.c       \
+	$(SRCDIR)/bedrock_conf.c \
 	$(SRCDIR)/util.c
 
 ASM_SRCS := \
 	$(ASMDIR)/asm_util.asm
 
-# Object files
-C_OBJS   := $(patsubst $(SRCDIR)/%.c,   $(BUILDDIR)/%.o,   $(C_SRCS))
+C_OBJS   := $(patsubst $(SRCDIR)/%.c,   $(BUILDDIR)/%.o,     $(C_SRCS))
 ASM_OBJS := $(patsubst $(ASMDIR)/%.asm, $(BUILDDIR)/%.asm.o, $(ASM_SRCS))
 ALL_OBJS := $(C_OBJS) $(ASM_OBJS)
 
-# Flags
-
-# Target: x86_64 Linux only (ENux is x86_64 for now)
+# Target: x86_64 Linux only
 ARCH_FLAGS := -m64 -march=x86-64 -mtune=generic
 
-# C flags shared by all builds
 CFLAGS_COMMON := \
-	$(ARCH_FLAGS)          \
-	-std=c11               \
-	-I$(INCDIR)            \
-	-Wall                  \
-	-Wextra                \
-	-Wpedantic             \
-	-Wformat=2             \
-	-Wstrict-prototypes    \
-	-Wmissing-prototypes   \
+	$(ARCH_FLAGS)            \
+	-std=c11                 \
+	-I$(INCDIR)              \
+	-Wall                    \
+	-Wextra                  \
+	-Werror                  \
+	-Wpedantic               \
+	-Wformat=2               \
+	-Wstrict-prototypes      \
+	-Wmissing-prototypes     \
 	-fstack-protector-strong \
-	-D_GNU_SOURCE          \
+	-D_GNU_SOURCE            \
 	-DENUX_VERSION=\"$(shell git describe --tags --always 2>/dev/null || echo dev)\"
 
-# Release flags
-CFLAGS_RELEASE := $(CFLAGS_COMMON) \
-	-O2                    \
-	-DNDEBUG               \
-	-ffunction-sections    \
-	-fdata-sections
-
-# Debug flags
-CFLAGS_DEBUG := $(CFLAGS_COMMON) \
-	-O0                    \
-	-g3                    \
-	-DDEBUG                \
-	-fsanitize=address,undefined \
-	-fno-omit-frame-pointer
-
-# NASM flags
-# -f elf64  : ELF64 output (x86_64 Linux)
-# -w+all    : enable all warnings
+# NASM flags: ELF64 output, all warnings
 NASMFLAGS := -f elf64 -w+all
 
-# Linker flags
-# -static        : fully static binary (no glibc .so dependency)
-#                  Critical for init — we run before any ld.so setup.
-# --gc-sections  : dead-strip unused sections (pairs with -ffunction-sections)
-# -z noexecstack : mark stack non-executable (security hardening)
+ifeq ($(DEBUG),1)
+# ASan cannot be linked statically; the debug binary is for host-side
+# testing, never for booting.
+CFLAGS  := $(CFLAGS_COMMON) -O0 -g3 -DDEBUG \
+	-fsanitize=address,undefined -fno-omit-frame-pointer
+LDFLAGS := -fsanitize=address,undefined \
+	-Wl,-z,noexecstack
+BIN     := $(BUILDDIR)/init.debug
+else
+# -static       : no libc.so dependency — we run before ld.so is usable
+# -z noexecstack: non-executable stack
+CFLAGS  := $(CFLAGS_COMMON) -O2 -DNDEBUG \
+	-ffunction-sections -fdata-sections
 LDFLAGS := \
 	-static                \
 	-Wl,--gc-sections      \
 	-Wl,-z,noexecstack     \
 	-Wl,--build-id=sha1
+BIN     := $(BUILDDIR)/init
+endif
 
-# Libraries needed (static versions)
-# libattr: for getxattr/setxattr
-# libc:    implicit with -static
-LIBS := -L/usr/local/lib -Wl,-rpath,/usr/local/lib
-
-# Def target
 .PHONY: all
-all: $(BUILDDIR)/init
+all: $(BIN)
 
-# Release build
-$(BUILDDIR)/init: CFLAGS := $(CFLAGS_RELEASE)
-$(BUILDDIR)/init: $(ALL_OBJS) | $(BUILDDIR)
-	$(CC) $(ARCH_FLAGS) $(LDFLAGS) -o $@ $(ALL_OBJS) $(LIBS)
+$(BIN): $(ALL_OBJS) | $(BUILDDIR)
+	$(CC) $(ARCH_FLAGS) $(LDFLAGS) -o $@ $(ALL_OBJS)
+ifneq ($(DEBUG),1)
 	$(STRIP) --strip-all $@
+endif
 	@echo ""
 	@echo "  Built: $@"
 	@ls -lh $@
 	@echo ""
 
-# Debug
 .PHONY: debug
-debug: CFLAGS := $(CFLAGS_DEBUG)
-debug: LDFLAGS_EXTRA := -fsanitize=address,undefined
-debug: $(ALL_OBJS) | $(BUILDDIR)
-	$(CC) $(ARCH_FLAGS) $(LDFLAGS) $(LDFLAGS_EXTRA) -o $(BUILDDIR)/init.debug $(ALL_OBJS) $(LIBS)
-	@echo "  Built: $(BUILDDIR)/init.debug (debug + ASan)"
+debug:
+	$(MAKE) DEBUG=1
 
-# Compile
+# Compile C (with auto-generated header dependencies)
+DEPFLAGS = -MT $@ -MMD -MP -MF $(BUILDDIR)/$*.d
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c | $(BUILDDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
-# Assmebly
-# NASM → ELF64 object, then the C compiler links it in normally.
+# Assemble NASM → ELF64 object
 $(BUILDDIR)/%.asm.o: $(ASMDIR)/%.asm | $(BUILDDIR)
 	$(NASM) $(NASMFLAGS) $< -o $@
 
-# Build dir
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
 # Install
-INSTALL_PATH ?= /bedrock/strata/bedrock/sbin/init
+#
+# The binary is installed ALONGSIDE the original Bedrock init, never over
+# it.  /bedrock/strata/bedrock/sbin/init must stay intact: it is the
+# dual-boot selector's option 2 and the pre-pivot fallback path — always.
+#
+# During install, the original init is backed up as init.sh.bak (shell
+# script) or init.bin.bak (binary) so the fallback/NOT_PID1 paths in the
+# C code can find it.
+# See INSTALL.md for activation (kernel init= parameter) and rollback.
+INSTALL_PATH      ?= /bedrock/strata/bedrock/sbin/enux-init
+ORIGINAL_INIT_PATH = /bedrock/strata/bedrock/sbin/init
 
-# Path that the fallback menu execs — must always point to the real
-# Bedrock shell init, never to our custom binary.
-FALLBACK_INIT ?= /sbin/init
+# Create a .sh.bak or .bin.bak backup of the original init, depending
+# on whether it is a shell script or binary.
+define do_backup
+	if [ -f $(ORIGINAL_INIT_PATH) ] && [ ! "$(ORIGINAL_INIT_PATH)" -ef "$(INSTALL_PATH)" ]; then \
+		if head -c 2 "$(ORIGINAL_INIT_PATH)" | grep -q "^#!"; then \
+			ext=".sh.bak"; \
+		else \
+			ext=".bin.bak"; \
+		fi; \
+		$(INSTALL) -m 0755 "$(ORIGINAL_INIT_PATH)" "$(ORIGINAL_INIT_PATH)$$ext"; \
+		echo "  Backed up: $(ORIGINAL_INIT_PATH) -> $(ORIGINAL_INIT_PATH)$$ext"; \
+	else \
+		echo "  No init to back up at $(ORIGINAL_INIT_PATH)"; \
+	fi
+endef
 
 .PHONY: install
 install: $(BUILDDIR)/init
-	@echo ""
-	@echo "  === init.c install ==="
-	@echo "  Target: $(INSTALL_PATH)"
-	@echo "  Fallback: $(FALLBACK_INIT)"
-	@echo ""
-	@if [ -f "$(INSTALL_PATH)" ]; then \
-		if head -c 2 "$(INSTALL_PATH)" 2>/dev/null | grep -q '^#!'; then \
-			cp "$(INSTALL_PATH)" "$(INSTALL_PATH).sh.bak"; \
-			echo "  [1/3] Existing shell init → $(INSTALL_PATH).sh.bak"; \
-		else \
-			cp "$(INSTALL_PATH)" "$(INSTALL_PATH).bin.bak"; \
-			echo "  [1/3] Existing binary init → $(INSTALL_PATH).bin.bak"; \
-		fi; \
-	fi
-	@if [ -f "$(INSTALL_PATH).sh.bak" ]; then \
-		echo "  [2/3] Copying backup to $(FALLBACK_INIT)"; \
-		rm -f "$(FALLBACK_INIT)"; \
-		cp "$(INSTALL_PATH).sh.bak" "$(FALLBACK_INIT)"; \
-		chmod 0755 "$(FALLBACK_INIT)"; \
-	elif [ -f "$(INSTALL_PATH).bin.bak" ]; then \
-		echo "  [2/3] Copying backup to $(FALLBACK_INIT)"; \
-		rm -f "$(FALLBACK_INIT)"; \
-		cp "$(INSTALL_PATH).bin.bak" "$(FALLBACK_INIT)"; \
-		chmod 0755 "$(FALLBACK_INIT)"; \
-	else \
-		echo "  [2/3] No backup to copy — run 'make install-fallback' for a fresh download"; \
-	fi
-	@echo "  [3/3] Installing custom init"
-	$(INSTALL) -D -m 0755 $< $(INSTALL_PATH)
-	@echo "  Installed to $(INSTALL_PATH)"
-	@echo ""
+	$(do_backup)
+	$(INSTALL) -D -m 0755 $(BUILDDIR)/init $(INSTALL_PATH)
+	@echo "  Installed: $(INSTALL_PATH)"
+	@echo "  Activate via kernel parameter: init=$(INSTALL_PATH)"
+	@echo "  See INSTALL.md for GRUB setup and rollback."
 
+# Download the official Bedrock Linux shell init for environments where
+# there was no existing init to back up, or a fresh copy is wanted.
+# Saves it as both the .sh.bak backup and /sbin/init recovery fallback.
 .PHONY: install-fallback
 install-fallback:
-	@echo ""
-	@echo "  === Fallback init download ==="
-	@echo "  Downloads official Bedrock Linux init to $(INSTALL_PATH).sh.bak"
-	@echo "  and copies it to $(FALLBACK_INIT)"
-	@echo ""
-	wget -O "$(INSTALL_PATH).sh.bak" \
-		https://raw.githubusercontent.com/bedrocklinux/bedrocklinux-userland/refs/heads/master/src/init/init
-	chmod 0755 "$(INSTALL_PATH).sh.bak"
-	cp "$(INSTALL_PATH).sh.bak" "$(FALLBACK_INIT)"
-	chmod 0755 "$(FALLBACK_INIT)"
-	@echo ""
-	@echo "  Saved: $(INSTALL_PATH).sh.bak"
-	@echo "  Saved: $(FALLBACK_INIT)"
-	@echo ""
+	@echo "  Fetching official Bedrock Linux shell init ..."
+	curl -sSL -o /tmp/bedrock-init \
+		"https://raw.githubusercontent.com/bedrocklinux/bedrocklinux/refs/heads/master/src/bedrock/usr/libexec/bedrock-init" || \
+		{ echo "FAIL: download failed"; exit 1; }
+	chmod 755 /tmp/bedrock-init
+	$(INSTALL) -D -m 0755 /tmp/bedrock-init $(ORIGINAL_INIT_PATH).sh.bak
+	echo "  Saved: $(ORIGINAL_INIT_PATH).sh.bak"
+	$(INSTALL) -D -m 0755 /tmp/bedrock-init /sbin/init
+	echo "  Saved: /sbin/init (recovery fallback)"
+	rm -f /tmp/bedrock-init
 
-# Test
-# These run on the build host (not in a Bedrock environment).
-# They test that the binary is sane before installation.
+# Smoke tests (run on the build host, not a Bedrock environment)
 .PHONY: check
 check: $(BUILDDIR)/init
 	@echo "Check: ELF type"
 	@file $(BUILDDIR)/init | grep -q "ELF 64-bit" && echo "  OK: ELF64" || (echo "FAIL: not ELF64"; exit 1)
 	@file $(BUILDDIR)/init | grep -q "statically linked" && echo "  OK: static" || (echo "FAIL: not static"; exit 1)
-	@echo "Check: no forbidden symbols"
-	@# Ensure we're not accidentally pulling in dynamic libc calls that
-	@# would fail before ld.so is set up
-	@nm $(BUILDDIR)/init 2>/dev/null | grep -v "asm_" | grep -qE "system\b|popen\b" \
-		&& (echo "FAIL: found system()/popen() — remove them"; exit 1) \
-		|| echo "  OK: no system()/popen()"
+	@echo "Check: no forbidden symbols (in objects; final binary is stripped)"
+	@nm $(C_OBJS) 2>/dev/null | grep -qE " U (system|popen|gets|strcpy|sprintf)$$" \
+		&& (echo "FAIL: forbidden libc call referenced"; exit 1) \
+		|| echo "  OK: no system/popen/gets/strcpy/sprintf"
 	@echo "Check: ASM symbols present"
-	@nm $(BUILDDIR)/init | grep -q "asm_memzero"  && echo "  OK: asm_memzero" || echo "WARN: asm_memzero missing"
-	@nm $(BUILDDIR)/init | grep -q "asm_strcmp"   && echo "  OK: asm_strcmp"  || echo "WARN: asm_strcmp missing"
-	@nm $(BUILDDIR)/init | grep -q "asm_write_str" && echo "  OK: asm_write_str" || echo "WARN: asm_write_str missing"
+	@for sym in asm_memzero asm_strcmp asm_write_str asm_poll_read asm_usleep; do \
+		nm $(ASM_OBJS) | grep -q "T $$sym" && echo "  OK: $$sym" || (echo "FAIL: $$sym missing"; exit 1); \
+	done
 	@echo "Check: binary size"
 	@ls -lh $(BUILDDIR)/init
 	@echo ""
 	@echo "All checks passed."
 
-# ls 
 .PHONY: size
-size: $(BUILDDIR)/init
-	@echo "Section sizes"
-	@size $(BUILDDIR)/init
-	@echo "Per-object contribution"
+size: $(BIN)
+	@size $(BIN)
 	@size $(ALL_OBJS)
 
 .PHONY: disasm
@@ -234,11 +199,6 @@ disasm: $(BUILDDIR)/init
 .PHONY: clean
 clean:
 	rm -rf $(BUILDDIR)
-
-# Auto-generate .d files so header changes trigger recompilation.
-DEPFLAGS = -MT $@ -MMD -MP -MF $(BUILDDIR)/$*.d
-$(BUILDDIR)/%.o: $(SRCDIR)/%.c $(BUILDDIR)/%.d | $(BUILDDIR)
-	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 DEPFILES := $(C_OBJS:.o=.d)
 $(DEPFILES):

@@ -1,16 +1,27 @@
 /*
  * init.c - main entry point
  *
- * Replaces the Bedrock shell init with a C program that:
- *   1. Sets essential environment and PATH
- *   2. Shows a first-boot boot menu with fallback option
- *   3. Sets up essential mounts (direct syscalls, no forks)
- *   4. Presents an interactive stratum/init selection menu
- *   5. Pivots root into the chosen stratum
- *   6. Enables ALL strata IN PARALLEL via fork()+waitpid()
- *   7. Validates critical paths before exec
- *   8. Execs the real init — this process is gone, real init owns PID 1
+ * Full behavioral replacement for the Bedrock Linux shell init, plus the
+ * ENux dual-boot selector.  Boot order matches the shell exactly:
  *
+ *   1.  not PID 1?            exec /bedrock/strata/bedrock/sbin/init.sh.bak
+ *   2.  ensure_essential_environment()
+ *   3.  setup_term(), logo
+ *   4.  ENux Boot Manager     (may exec the original shell init)
+ *   5.  complete_hijack()     (first boot after hijack install only)
+ *   6.  complete_upgrade()
+ *   7.  bedrock.conf [init]   timeout / default, default resolution
+ *   8.  bedrock_init= cmdline tuple, or interactive menu
+ *   9.  mount fstab           (dmsetup, lvm, mount -a)
+ *   10. pivot_root into the chosen stratum
+ *   11. preenable shared mounts
+ *   12. brl-repair bedrock + init stratum, brl-enable the rest (parallel)
+ *   13. brl-apply --skip-repair
+ *   14. exec the chosen init  — never returns
+ *
+ * Failure policy: before the pivot, fall back to the original Bedrock
+ * shell init; from the pivot onward, panic() drops to an emergency shell
+ * (re-running the shell init against a half-pivoted root would not work).
  */
 
 #include <stdio.h>
@@ -18,215 +29,224 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 #include "init.h"
+#include "bedrock_conf.h"
+#include "stratum.h"
 
-/* If we are not PID 1, hand off to the real (backup) init immediately. */
-static void check_pid1(char **argv)
-{
-    if (getpid() != 1) {
-        execv("/sbin/init-bedrock-backup", argv);
-        panic("Not PID 1 and backup init exec failed: %s", strerror(errno));
-    }
-}
-
-/* Parse bedrock_init= from /proc/cmdline.
+/* Parse bedrock_init=stratum:cmd from /proc/cmdline.
  * Returns 1 and fills buf if found, 0 otherwise. */
 static int cmdline_init_tuple(char *buf, size_t bufsz)
 {
     char line[4096];
-    int  fd, n;
-    char *p, *end;
 
-    fd = open("/proc/cmdline", O_RDONLY);
-    if (fd < 0) return 0;
-
-    n = (int)read(fd, line, sizeof(line) - 1);
+    int fd = open("/proc/cmdline", O_RDONLY);
+    if (fd < 0)
+        return 0;
+    ssize_t n = read(fd, line, sizeof(line) - 1);
     close(fd);
-    if (n <= 0) return 0;
+    if (n <= 0)
+        return 0;
     line[n] = '\0';
 
-    p = strstr(line, "bedrock_init=");
-    if (!p) return 0;
-
+    char *p = strstr(line, "bedrock_init=");
+    if (!p)
+        return 0;
     p += strlen("bedrock_init=");
-    end = p;
-    while (*end && *end != ' ' && *end != '\t' && *end != '\n') end++;
 
-    if ((size_t)(end - p) >= bufsz) return 0;
+    char *end = p;
+    while (*end && *end != ' ' && *end != '\t' && *end != '\n')
+        end++;
+
+    if ((size_t)(end - p) >= bufsz)
+        return 0;
     memcpy(buf, p, (size_t)(end - p));
     buf[end - p] = '\0';
-    return 1;
+    return buf[0] != '\0';
 }
 
-/* Validate that a path exists, is not a broken symlink, and is executable.
- * Returns 1 if OK, 0 if broken/missing. */
-static int validate_binary(const char *path)
+/*
+ * Read [init] timeout/default from bedrock.conf and resolve the default
+ * tuple, mirroring the shell's startup block: dereference the stratum
+ * alias, resolve the command inside the stratum, and on any failure warn
+ * and fall back to wait-forever (timeout -1, no default).
+ */
+static void load_init_config(InitState *st)
 {
-    struct stat st;
-    if (lstat(path, &st) < 0)
-        return 0;
-    if (S_ISLNK(st.st_mode)) {
-        char target[MAX_PATH_LEN];
-        ssize_t len = readlink(path, target, sizeof(target) - 1);
-        if (len < 0 || len >= (ssize_t)sizeof(target))
-            return 0;
-        target[len] = '\0';
-        if (access(target, X_OK) != 0)
-            return 0;
+    char val[MAX_PATH_LEN];
+
+    st->timeout = 30;
+    if (cfg_value("init", "timeout", val, sizeof(val)) == 0) {
+        st->timeout = atoi(val);
+        if (st->timeout < 0)
+            st->timeout = -1;
     }
-    if (access(path, X_OK) != 0)
-        return 0;
-    return 1;
-}
 
-/* Validate bedrock base environment is present and usable. */
-static int validate_bedrock_base(void)
-{
-    struct stat st;
-    if (lstat(BEDROCK_ROOT "/strata/bedrock", &st) < 0)
-        return 0;
-    if (S_ISLNK(st.st_mode)) {
-        notice(COL_YELLOW "warn" COL_RESET ": " BEDROCK_ROOT "/strata/bedrock is a symlink");
+    st->def_stratum[0] = '\0';
+    st->def_cmd[0]     = '\0';
+    st->def_path[0]    = '\0';
+
+    char tuple[MAX_PATH_LEN] = "";
+    if (cfg_value("init", "default", tuple, sizeof(tuple)) < 0 ||
+        tuple[0] == '\0') {
+        st->timeout = -1;
+        return;
     }
-    return 1;
-}
 
-/* Safe fallback: try to exec /sbin/init (the protected backup). */
-static void try_fallback_init(char **argv)
-{
-    static const char *fallback_candidates[] = {
-        "/sbin/init",
-        NULL
-    };
+    char *colon = strchr(tuple, ':');
+    if (colon) {
+        *colon = '\0';
+        snprintf(st->def_cmd, sizeof(st->def_cmd), "%s", colon + 1);
+    }
 
-    for (int i = 0; fallback_candidates[i]; i++) {
-        if (validate_binary(fallback_candidates[i])) {
-            notice("Attempting fallback: %s", fallback_candidates[i]);
-            execv(fallback_candidates[i], argv);
+    if (deref(tuple, st->def_stratum, sizeof(st->def_stratum)) < 0)
+        st->def_stratum[0] = '\0';
+
+    if (st->def_stratum[0] && st->def_cmd[0]) {
+        char root[MAX_PATH_LEN];
+        char link[MAX_PATH_LEN];
+        snprintf(root, sizeof(root), STRATA_DIR "/%s", st->def_stratum);
+
+        struct stat sb;
+        if (stat(root, &sb) == 0 && S_ISDIR(sb.st_mode) &&
+            stratum_realpath(root, st->def_cmd, link, sizeof(link)) == 0) {
+            if (joincat(st->def_path, sizeof(st->def_path),
+                        root, link, NULL) < 0 ||
+                access(st->def_path, X_OK) != 0)
+                st->def_path[0] = '\0';
         }
     }
 
-    panic("No fallback init found — system cannot boot");
+    if (st->def_path[0] == '\0') {
+        warn("%s [init]/default does not describe a valid "
+             "stratum:init pair", BEDROCK_CONF);
+        st->timeout        = -1;
+        st->def_stratum[0] = '\0';
+        st->def_cmd[0]     = '\0';
+    }
 }
 
 int main(int argc, char **argv)
 {
     (void)argc;
 
-    InitState st;
+    static InitState st;   /* zero-initialized BSS; large struct */
 
-    /* Safety: if not PID 1, exec backup init */
-    check_pid1(argv);
+    /* Not PID 1: hand off immediately, like the shell.
+     * Try each candidate path in order; the Makefile's install target
+     * creates .sh.bak or .bin.bak from the original init. */
+    if (getpid() != 1) {
+        static const char *candidates[] = {
+            NOT_PID1_BACKUP,
+            "/bedrock/strata/bedrock/sbin/init.bin.bak",
+            "/sbin/init-bedrock-backup",
+            NULL
+        };
+        for (int i = 0; candidates[i]; i++) {
+            if (access(candidates[i], X_OK) == 0) {
+                argv[0] = (char *)candidates[i];
+                execv(candidates[i], argv);
+            }
+        }
+        panic("not PID 1 and no backup init available");
+    }
 
-    /* Zero out state (uses ASM helper) */
     asm_memzero(&st, sizeof(st));
 
-    /* 1. Set PATH explicitly — critical for PID 1 where env may be empty */
-    setenv("PATH", DEFAULT_PATH, 1);
+    /* PID 1 starts with an empty environment; children need a PATH. */
+    if (setenv("PATH", DEFAULT_PATH, 1) < 0)
+        warn("setenv PATH: %s", strerror(errno));
 
-    /* 2. Essential mounts, terminal, logo */
     ensure_essential_environment();
     setup_term();
     print_logo();
 
-    /* 3. Validate bedrock base before proceeding */
-    if (!validate_bedrock_base()) {
-        notice(COL_RED "error" COL_RESET ": bedrock base environment broken");
-        try_fallback_init(argv);
+    /* ENux Boot Manager — before any state mutation, so choosing the
+     * Bedrock init hands over a pristine system. */
+    run_enux_selector(argv);
+
+    /* First boot after a hijack install, then upgrade leftovers. */
+    maybe_complete_hijack();
+    complete_upgrade();
+
+    /* bedrock.conf [init] */
+    load_init_config(&st);
+
+    if (scan_strata(&st) <= 0) {
+        warn("no strata found in " STRATA_DIR);
+        fallback_to_bedrock_init(argv);
     }
 
-    /* 5. Parse bedrock.conf */
-    if (parse_bedrock_conf(&st) < 0)
-        panic("Failed to parse " BEDROCK_CONF);
+    /* Choose the init: kernel cmdline tuple wins, else the menu. */
+    st.init_index = -1;
 
-    /* 6. Scan available strata */
-    if (scan_strata(&st) < 0)
-        panic("Failed to scan strata in " STRATA_DIR);
-
-    /* 7. Resolve which init to use */
-    char forced_tuple[MAX_PATH_LEN] = {0};
-    int  from_cmdline = cmdline_init_tuple(forced_tuple, sizeof(forced_tuple));
-
-    if (from_cmdline) {
-        char *colon = strchr(forced_tuple, ':');
-        if (!colon)
-            panic("bedrock_init= on cmdline has no colon: %s", forced_tuple);
-
+    char tuple[MAX_PATH_LEN];
+    if (cmdline_init_tuple(tuple, sizeof(tuple))) {
+        char *colon = strchr(tuple, ':');
+        if (!colon) {
+            warn("bedrock_init= has no colon: %s", tuple);
+            fallback_to_bedrock_init(argv);
+        }
         *colon = '\0';
-        const char *kstrat = forced_tuple;
-        const char *kcmd   = colon + 1;
 
-        st.init_index = -1;
+        char real[MAX_NAME_LEN];
+        if (deref(tuple, real, sizeof(real)) < 0)
+            snprintf(real, sizeof(real), "%.*s",
+                     (int)sizeof(real) - 1, tuple);
+
         for (int i = 0; i < st.n_strata; i++) {
-            if (asm_strcmp(st.strata[i].name, kstrat) == 0) {
+            if (asm_strcmp(st.strata[i].name, real) == 0) {
                 st.init_index = i;
-                strncpy(st.init_cmd, kcmd, MAX_PATH_LEN - 1);
+                snprintf(st.init_cmd, sizeof(st.init_cmd),
+                         "%s", colon + 1);
                 break;
             }
         }
         if (st.init_index < 0) {
-            notice(COL_RED "error" COL_RESET ": bedrock_init= stratum '%s' not found", kstrat);
-            try_fallback_init(argv);
+            warn("bedrock_init= stratum '%s' not found", tuple);
+            fallback_to_bedrock_init(argv);
         }
     } else {
         st.init_index = run_menu(&st);
-        if (st.init_index < 0) {
-            notice(COL_RED "error" COL_RESET ": No init selected");
-            try_fallback_init(argv);
-        }
-        strncpy(st.init_cmd,
-                st.strata[st.init_index].init_cmd,
-                MAX_PATH_LEN - 1);
+        if (st.init_index < 0)
+            fallback_to_bedrock_init(argv);
     }
 
     Stratum *init_s = &st.strata[st.init_index];
 
-    /* 8. Mount fstab (dmsetup, lvm, mount -a equivalent) */
     step(1, 6, "Mounting " COL_CYAN "fstab" COL_RESET);
     mount_fstab();
 
-    /* 9. pivot_root into the chosen stratum */
     step(2, 6, "Pivoting to " COL_GREEN "%s" COL_RESET, init_s->name);
     pivot_root_to(init_s->root);
 
-    /* 10. Pre-enable shared mounts */
     step(3, 6, "Preparing to enable");
-    preenable_mounts(init_s->root);
+    preenable_mounts();
 
-    /* 11. Enable ALL strata in parallel */
-    step(4, 6, "Enabling " COL_YELLOW "strata" COL_RESET " (parallel)");
+    step(4, 6, "Enabling " COL_YELLOW "strata" COL_RESET);
     enable_strata_parallel(&st);
 
-    /* 12. Apply configuration (must fork — if brl-apply ran as PID 1
-     * and exited, the kernel would panic) */
     step(5, 6, "Applying configuration");
     {
-        pid_t pid = fork();
-        if (pid == 0) {
-            execv("/bedrock/libexec/brl-apply",
-                  (char *[]){ "brl-apply", "--skip-repair", NULL });
-            _exit(127);
-        }
-        if (pid > 0) waitpid(pid, NULL, 0);
+        int rc = run_cmd((char *[]){
+            BEDROCK_ROOT "/libexec/brl-apply", "--skip-repair", NULL }, 0);
+        if (rc != 0)
+            warn("brl-apply exited %d", rc);
     }
 
-    /* 13. Hand off to the real init */
-    step(6, 6, "Handing control to " COL_GREEN "%s" COL_RESET ":" COL_CYAN "%s" COL_RESET,
-         init_s->name, st.init_cmd);
+    step(6, 6, "Handing control to " COL_GREEN "%s" COL_RESET
+         ":" COL_CYAN "%s" COL_RESET, init_s->name, st.init_cmd);
 
-    if (!validate_binary(st.init_cmd)) {
-        notice(COL_RED "error" COL_RESET ": Chosen init '%s' is not executable",
-               st.init_cmd);
-        try_fallback_init(argv);
-    }
+    if (access(st.init_cmd, X_OK) != 0)
+        panic("chosen init '%s' is not executable: %s",
+              st.init_cmd, strerror(errno));
 
+    argv[0] = st.init_cmd;
     execv(st.init_cmd, argv);
 
     panic("exec of '%s' failed: %s", st.init_cmd, strerror(errno));
-    return 1;
 }
