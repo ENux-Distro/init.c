@@ -65,11 +65,9 @@ void timing_mark(const char *label, unsigned long start_ms)
 /*
  * panic()
  *
- * Mirrors the shell's fatal_error(): print the message, then drop to an
- * emergency shell.  Used for failures after pivot_root, where re-running
- * the Bedrock shell init would redo mounts against a half-pivoted world.
- * Output goes through asm_write_str (raw write(2)) so it works even with
- * corrupted stdio state.
+ * Print the message, then drop to an emergency shell. Output goes through
+ * asm_write_str (raw write(2)) so it works even with corrupted stdio
+ * state. The last resort for a PID 1 with nowhere left to hand off.
  */
 void panic(const char *fmt, ...)
 {
@@ -83,10 +81,9 @@ void panic(const char *fmt, ...)
     asm_write_str(STDERR_FILENO, buf);
     asm_write_str(STDERR_FILENO, "\n\nStarting emergency shell\nGood luck\n\n");
 
-    /* busybox dispatches on argv[0], so exec it with argv[0] = "sh" */
-    execv("/bedrock/libexec/busybox", (char *[]){ "sh", NULL });
     execv("/bin/sh", (char *[]){ "sh", NULL });
     execv("/sbin/sh", (char *[]){ "sh", NULL });
+    execv("/bin/bash", (char *[]){ "sh", NULL });
 
     /* Nothing left to run as PID 1 — exiting causes a kernel panic,
      * which is the honest outcome at this point. */
@@ -110,23 +107,19 @@ int is_self(const char *path)
 }
 
 /*
- * fallback_to_bedrock_init()
+ * fallback_to_backup_init()
  *
- * Pre-pivot fatal path: hand the boot to the original Bedrock shell init
- * or any available backup init.  Tries multiple known paths so we don't
- * hang PID 1 if the primary path was overwritten or is missing.
- *
- * BEDROCK_SHELL_INIT is checked first but skipped if it points to our
- * own binary (to avoid an exec loop when init.c was placed at or linked
- * from the shell init's path).
+ * Pre-pivot fatal path: hand the boot to any available backup init.
+ * Tries multiple known paths so we don't hang PID 1 if the primary
+ * backup was overwritten or is missing.  Each candidate is skipped if
+ * it points to our own binary (avoids an exec loop).
  */
-void fallback_to_bedrock_init(char **argv)
+void fallback_to_backup_init(char **argv)
 {
     static const char *candidates[] = {
-        BEDROCK_SHELL_INIT,
         NOT_PID1_BACKUP,
-        "/bedrock/strata/bedrock/sbin/init.bin.bak",
-        "/sbin/init-bedrock-backup",
+        "/enux/layer/enux/sbin/init.bin.bak",
+        "/sbin/init-enux-backup",
         "/sbin/init",
         NULL
     };
@@ -142,7 +135,7 @@ void fallback_to_bedrock_init(char **argv)
             execv(candidates[i], argv);
         }
     }
-    panic("no backup bedrock init available");
+    panic("no backup init available");
 }
 
 void notice(const char *fmt, ...)

@@ -1,12 +1,10 @@
 /*
- * init.c - bedrock.conf parser
+ * init.c - enux.conf parser
  *
- * Replaces common-code's cfg_preparse/cfg_value/cfg_values awk pipelines.
- *
- * The file is read once into a static buffer (no malloc) and preparsed in
- * place: backslash-newline continuations are joined and '#'/';' comments
- * are stripped, mirroring cfg_preparse exactly.  Queries then scan the
- * buffer line by line.
+ * INI-style reader for /enux/etc/enux.conf. The file is read once into a
+ * static buffer (no malloc) and preparsed in place: backslash-newline
+ * continuations are joined and '#'/';' comments stripped. Queries then
+ * scan the buffer line by line.
  */
 
 #include <stdio.h>
@@ -17,9 +15,9 @@
 #include <unistd.h>
 
 #include "init.h"
-#include "bedrock_conf.h"
+#include "enux_conf.h"
 
-/* bedrock.conf ships at ~10KB; 64KB leaves generous headroom. */
+/* enux.conf is tiny; 64KB is generous headroom. */
 static char cfg_buf[65536];
 static size_t cfg_len    = 0;
 static int    cfg_loaded = 0;   /* 0 = not tried, 1 = ok, -1 = failed */
@@ -38,9 +36,9 @@ static int cfg_load(void)
     if (cfg_loaded)
         return cfg_loaded;
 
-    int fd = open(BEDROCK_CONF, O_RDONLY);
+    int fd = open(ENUX_CONF, O_RDONLY);
     if (fd < 0) {
-        warn("cannot open %s: %s", BEDROCK_CONF, strerror(errno));
+        warn("cannot open %s: %s", ENUX_CONF, strerror(errno));
         cfg_loaded = -1;
         return -1;
     }
@@ -51,7 +49,7 @@ static int cfg_load(void)
         if (n < 0) {
             if (errno == EINTR)
                 continue;
-            warn("read %s: %s", BEDROCK_CONF, strerror(errno));
+            warn("read %s: %s", ENUX_CONF, strerror(errno));
             close(fd);
             cfg_loaded = -1;
             return -1;
@@ -61,7 +59,7 @@ static int cfg_load(void)
         total += (size_t)n;
         if (total >= sizeof(cfg_buf) - 1) {
             warn("%s larger than %zu bytes; truncated",
-                 BEDROCK_CONF, sizeof(cfg_buf) - 1);
+                 ENUX_CONF, sizeof(cfg_buf) - 1);
             break;
         }
     }
@@ -97,8 +95,8 @@ static int cfg_load(void)
     return 1;
 }
 
-/* Walk preparsed config lines.  For each key=value line inside [section]
- * whose key matches, invoke cb(value).  Returns number of matches. */
+/* Walk preparsed config lines. For each key=value line inside [section]
+ * whose key matches, invoke cb(value). Returns number of matches. */
 typedef void (*cfg_cb)(const char *value, void *ud);
 
 static int cfg_foreach(const char *section, const char *key,
@@ -217,8 +215,7 @@ int cfg_values(const char *section, const char *key,
     return u.count;
 }
 
-/* cfg_keys — list every key in a section.  Mirrors cfg_foreach's line walk
- * but yields the key rather than filtering on it. */
+/* cfg_keys — list every key in a section. */
 int cfg_keys(const char *section, char out[][MAX_PATH_LEN], int max)
 {
     if (cfg_load() < 0)

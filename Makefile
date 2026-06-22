@@ -28,14 +28,10 @@ BUILDDIR := build
 endif
 
 C_SRCS := \
-	$(SRCDIR)/main.c         \
-	$(SRCDIR)/env.c          \
-	$(SRCDIR)/mount.c        \
-	$(SRCDIR)/stratum.c      \
-	$(SRCDIR)/menu.c         \
-	$(SRCDIR)/hijack.c       \
-	$(SRCDIR)/bedrock_conf.c \
-	$(SRCDIR)/brl.c          \
+	$(SRCDIR)/main.c      \
+	$(SRCDIR)/env.c       \
+	$(SRCDIR)/enux_conf.c \
+	$(SRCDIR)/layer.c     \
 	$(SRCDIR)/util.c
 
 ASM_SRCS := \

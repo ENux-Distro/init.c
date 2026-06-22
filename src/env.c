@@ -63,7 +63,7 @@ static void modprobe(const char *mod, int silent)
         run_cmd((char *[]){ "/sbin/modprobe", (char *)mod, NULL }, silent);
         return;
     }
-    if (access(BEDROCK_ROOT "/libexec/kmod", X_OK) == 0) {
+    if (access(ENUX_ROOT "/libexec/kmod", X_OK) == 0) {
         pid_t pid = fork();
         if (pid < 0)
             return;
@@ -77,7 +77,7 @@ static void modprobe(const char *mod, int silent)
                 }
             }
             /* kmod dispatches on argv[0] */
-            execv(BEDROCK_ROOT "/libexec/kmod",
+            execv(ENUX_ROOT "/libexec/kmod",
                   (char *[]){ "modprobe", (char *)mod, NULL });
             _exit(127);
         }
@@ -148,8 +148,8 @@ void ensure_essential_environment(void)
         if (mount("devtmpfs", "/dev", "devtmpfs",
                   MS_NOSUID, "mode=0755") < 0 && errno != EBUSY)
             warn("mount devtmpfs: %s", strerror(errno));
-        if (access(BEDROCK_ROOT "/libexec/busybox", X_OK) == 0)
-            run_cmd((char *[]){ BEDROCK_ROOT "/libexec/busybox",
+        if (access(ENUX_ROOT "/libexec/busybox", X_OK) == 0)
+            run_cmd((char *[]){ ENUX_ROOT "/libexec/busybox",
                                 "mdev", "-s", NULL }, 1);
     }
 
@@ -207,7 +207,7 @@ void ensure_essential_environment(void)
     {
         struct stat sb;
         if (lstat("/run/systemd", &sb) == 0 && S_ISDIR(sb.st_mode)) {
-            int rc = run_cmd((char *[]){ BEDROCK_ROOT "/libexec/busybox",
+            int rc = run_cmd((char *[]){ ENUX_ROOT "/libexec/busybox",
                                          "rm", "-r", "/run/systemd",
                                          NULL }, 1);
             if (rc != 0)
@@ -240,12 +240,12 @@ void ensure_essential_environment(void)
  */
 void setup_term(void)
 {
-    if (access(BEDROCK_ROOT "/libexec/plymouth-quit", X_OK) == 0)
-        run_cmd((char *[]){ BEDROCK_ROOT "/libexec/plymouth-quit",
+    if (access(ENUX_ROOT "/libexec/plymouth-quit", X_OK) == 0)
+        run_cmd((char *[]){ ENUX_ROOT "/libexec/plymouth-quit",
                             NULL }, 1);
 
-    if (access(BEDROCK_ROOT "/libexec/manage_tty_lock", X_OK) == 0)
-        run_cmd((char *[]){ BEDROCK_ROOT "/libexec/manage_tty_lock",
+    if (access(ENUX_ROOT "/libexec/manage_tty_lock", X_OK) == 0)
+        run_cmd((char *[]){ ENUX_ROOT "/libexec/manage_tty_lock",
                             "unlock", NULL }, 1);
 
     /* RIS — full terminal reset, the escape `reset` ultimately sends. */

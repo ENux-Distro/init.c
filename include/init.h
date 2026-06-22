@@ -1,5 +1,10 @@
 /* init.c
  * init.h — shared types, constants, and prototypes
+ *
+ * init.c is the ENux pre-init: it runs as PID 1 on the ENux base system,
+ * mounts the essential filesystems, brings up the installed layers (via
+ * /enux/libexec/layer-enable, so they are ready for `layer enter`), and
+ * then execs the base system's real init. It does not pivot into a layer.
  */
 
 #ifndef ENUX_INIT_H
@@ -9,33 +14,30 @@
 #include <stdint.h>
 #include <sys/types.h>
 
-#define MAX_STRATA        16
+#define MAX_LAYERS        16
 #define MAX_PATH_LEN      512
 #define MAX_NAME_LEN      64
-#define MAX_INIT_PATHS    16
 
-#define BEDROCK_ROOT      "/bedrock"
-#define STRATA_DIR        "/bedrock/strata"
-#ifndef BEDROCK_CONF /* overridable for host-side testing */
-#define BEDROCK_CONF      "/bedrock/etc/bedrock.conf"
+#define ENUX_ROOT         "/enux"
+#define LAYER_DIR         "/enux/layer"
+#ifndef ENUX_CONF /* overridable for host-side testing */
+#define ENUX_CONF         "/enux/etc/enux.conf"
 #endif
-#define BEDROCK_RELEASE   "/bedrock/etc/bedrock-release"
+#define ENUX_RELEASE      "/enux/etc/enux-release"
 
-/* The original Bedrock Linux shell init.  Must remain intact at this path;
- * the dual-boot selector execs it directly and the install procedure never
- * overwrites it (see INSTALL.md). */
-#define BEDROCK_SHELL_INIT "/bedrock/strata/bedrock/sbin/init"
+/* Brings up one layer's mounts so it is usable for `layer enter`. This is
+ * the same script the user-facing tooling calls; init forks it once per
+ * non-base layer at boot. */
+#define LAYER_ENABLE_BIN  "/enux/libexec/layer-enable"
 
-/* Primary backup path for the original init, created by `make install`.
- * The C code tries multiple paths (this one, .bin.bak, /sbin/init-bedrock-backup)
- * before giving up, so a missing .bak file won't hang PID 1. */
-#define NOT_PID1_BACKUP    "/bedrock/strata/bedrock/sbin/init.sh.bak"
+/* Primary backup path for whatever init.c replaces, created by
+ * `make install`. The non-PID-1 path tries this first, then the others in
+ * util.c, so a missing backup never hangs PID 1. */
+#define NOT_PID1_BACKUP    "/enux/layer/enux/sbin/init.sh.bak"
 
-/* First-install flag file; presence means complete_hijack() must run. */
-#define HIJACK_FLAG        "/bedrock/complete-hijack-install"
-
-/* Dual-boot selector: seconds before defaulting to the ENux init. */
-#define ENUX_SELECTOR_TIMEOUT 5
+/* Default init to exec on the base once layers are up, when enux.conf does
+ * not specify one. */
+#define DEFAULT_BASE_INIT  "/sbin/init"
 
 #define COL_RESET   "\033[0m"
 #define COL_RED     "\033[1;31m"
@@ -48,75 +50,47 @@
 #define DEFAULT_PATH "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 typedef struct {
-    char name[MAX_NAME_LEN];       /* stratum name, e.g. "arch"      */
-    char root[MAX_PATH_LEN];       /* /bedrock/strata/<name>         */
-    int  show_init;                /* user.bedrock.show_init present */
-    int  show_boot;                /* user.bedrock.show_boot present */
-} Stratum;
+    char name[MAX_NAME_LEN];       /* layer name, e.g. "arch"  */
+    char root[MAX_PATH_LEN];       /* /enux/layer/<name>        */
+} Layer;
 
 typedef struct {
-    Stratum strata[MAX_STRATA];
-    int     n_strata;
-    int     init_index;                  /* chosen stratum index            */
-    char    init_cmd[MAX_PATH_LEN];      /* cmd to exec post-pivot, as
-                                          * configured (e.g. /sbin/init)    */
-    int     timeout;                     /* menu timeout; -1 = wait forever */
-    char    def_stratum[MAX_NAME_LEN];   /* dereferenced default stratum    */
-    char    def_cmd[MAX_PATH_LEN];       /* default cmd from bedrock.conf   */
-    char    def_path[MAX_PATH_LEN];      /* resolved default init path
-                                          * (pre-pivot), "" if invalid      */
+    Layer layers[MAX_LAYERS];
+    int   n_layers;
+    char  base[MAX_NAME_LEN];          /* base layer name; never chrooted */
+    char  base_init[MAX_PATH_LEN];     /* init to exec on the base        */
 } InitState;
 
 /* env.c */
 void ensure_essential_environment(void);
 void setup_term(void);
 
-/* mount.c */
-void mount_fstab(void);
-void pivot_root_to(const char *stratum_root);
-void preenable_mounts(void);
-int  mkdirp(const char *path, mode_t mode);
-
-/* menu.c */
-void print_logo(void);
-void run_enux_selector(char **argv);
-int  run_menu(InitState *st);   /* returns chosen stratum index, -1 on fail */
-
-/* hijack.c */
-void maybe_complete_hijack(void);
-void complete_upgrade(void);
+/* layer.c */
+int  scan_layers(InitState *st);            /* fill st->layers; count, -1 err */
+void enable_layers(InitState *st);          /* fork layer-enable per non-base */
 
 /* util.c */
 void panic(const char *fmt, ...)
     __attribute__((noreturn, format(printf, 1, 2)));
-void fallback_to_bedrock_init(char **argv) __attribute__((noreturn));
+void fallback_to_backup_init(char **argv) __attribute__((noreturn));
 void notice(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void warn(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void step(int n, int total, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
+int  run_cmd(char *const argv[], int silent);
+int  is_self(const char *path);
+int  joincat(char *out, size_t outsz, ...) __attribute__((sentinel));
 
-/* Boot timing instrumentation.  Disabled unless `enux_timing` is present
- * on the kernel command line, so production boots stay quiet.  Throwaway
- * scaffolding for the brl-in-C port decision; remove once measured. */
+/* Boot timing instrumentation. Disabled unless `enux_timing` is on the
+ * kernel command line. */
 extern int    timing_enabled;
 void          timing_init(void);
 unsigned long timing_now_ms(void);
 void          timing_mark(const char *label, unsigned long start_ms);
-int  run_cmd(char *const argv[], int silent);
-int  is_self(const char *path);
-/* Concatenate NUL-terminated strings into out; the list ends with NULL.
- * Returns 0, or -1 (out set to "") if the result would not fit. */
-int  joincat(char *out, size_t outsz, ...) __attribute__((sentinel));
 
 /* asm_util.asm (linked in) */
 extern void asm_memzero(void *dst, size_t n);
 extern int  asm_strcmp(const char *a, const char *b);
 extern void asm_write_str(int fd, const char *s);   /* async-signal-safe */
-/* Poll fd for input up to timeout_ms (-1 = forever), then read one byte.
- * Returns the byte (0-255), -1 on timeout, -2 on error/EOF.
- * Pure syscalls (poll + read), async-signal-safe, EINTR-retrying. */
-extern int  asm_poll_read(int fd, int timeout_ms);
-/* nanosleep wrapper, EINTR-retrying.  Pure syscall. */
-extern void asm_usleep(unsigned long usec);
 
 #endif /* ENUX_INIT_H */

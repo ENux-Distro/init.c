@@ -1,169 +1,72 @@
 # init.c
 
-init.c replaces Bedrock Linux's shell-based init (`/bedrock/strata/bedrock/sbin/init`) with a minimal C + x86_64 ASM static binary. It does the same job: pivot into the chosen stratum, enable all strata, hand off to the real init, but it's ~10%* faster than Bedrock Linux's init.
+init.c is the init for [The ENux Layer](https://github.com/ENux-Distro/The-ENux-Layer):
+a minimal C + x86_64 ASM static binary that runs as PID 1 on the ENux base
+system, brings the installed layers up, and hands off to the base's real
+init.
 
-## Why init.c?
+It is **not** a Bedrock init. Earlier revisions were a port of Bedrock
+Linux's shell init (pivot into a stratum, `brl-enable` every stratum in
+parallel, etcfs/crossfs, hijack install); all of that has been removed.
+The ENux Layer's model is simpler: a layer is a rootfs under
+`/enux/layer/<name>`, brought up by bind-mounting it onto itself and
+mounting `/proc`, `/sys`, `/dev` into it — the job of
+`/enux/libexec/layer-enable`.
 
-Bedrock Linux's init is a shell script. At every boot it:
-
-- Forks subprocesses for `grep`, `awk`, `sed`, `realpath`, `mount`
-- Enables strata **sequentially** — one at a time, each taking several seconds
-- Pipes data through chains of shell utilities
-
-init.c replaces all of that with direct syscalls and parallel stratum enablement. The result: **the slowest single stratum sets the wall clock, not the sum of all of them**.
-
-## How it works
+## What it does
 
 ```
 main()
-├── check_pid1()           → if not PID 1, exec backup immediately
-├── ensure_essential_env() → mount /proc, /sys, /dev, /run
-├── setup_term()           → configure TTY, kill plymouth
-├── print_logo()           → Bedrock ASCII art
-├── parse_bedrock_conf()   → read [init] section from bedrock.conf
-├── scan_strata()          → list /bedrock/strata/*
-├── run_menu()             → interactive stratum/init selection
-├── mount_fstab()          → dmsetup, lvm, mount -a (direct syscalls)
-├── pivot_root_to()        → bind-mount stratum + pivot_root
-├── preenable_mounts()     → rbind /proc, /dev, /sys, /run
-├── enable_strata_parallel() → fork ALL strata at once
-│   ├── brl-repair bedrock (foreground)
-│   ├── brl-repair <init>  (foreground)
-│   └── brl-enable <N>…   (parallel — one child per stratum)
-├── brl-apply              → apply configuration (forked)
-└── execv(<real init>)     → PID 1 hands off, never returns
+├── not PID 1?               → exec a backup init and bail
+├── ensure_essential_env()   → mount /proc, /sys, /dev, /run, fuse
+├── setup_term()             → reset the console, quit plymouth if present
+├── print_logo()
+├── load_init_config()       → read enux.conf: base layer + base init cmd
+├── scan_layers()            → list /enux/layer/* (directories only)
+├── enable_layers()          → fork /enux/libexec/layer-enable per
+│                              non-base layer, in parallel, then reap
+└── execv(<base init>)       → hand PID 1 to the base's real init
 ```
 
-### Key design decisions
+The base system is the running root; init.c never pivots into it or any
+other layer. Layers are entered on demand at runtime with `layer enter`.
 
-- **Statically linked** — no libc.so dependency; safe to run before ld.so is set up
-- **Direct syscalls** — `mount(2)`, `pivot_root(2)`, `open(2)`/`read(2)` for everything; no `system()`, no `popen()`
-- **Parallel enable** — all strata except bedrock and the init stratum are `brl-enable`'d simultaneously via `fork()` + `waitpid(-1)`
-- **x86_64 ASM helpers** — `asm_memzero`, `asm_strcmp`, `asm_write_str` for hot paths and async-signal-safe panic output
-- **No runtime downloads** — the Makefile never fetches files during install; `make install-fallback` is a separate manual step
+## Configuration
 
-## Dependencies
+Read from `/enux/etc/enux.conf`:
 
-### Build-time
+```ini
+[layers]
+exec_order = enux,arch,fedora   # first entry is the base (never chrooted)
 
-| Tool  | Purpose           |
-|-------|-------------------|
-| gcc   | C compilation     |
-| nasm  | Assembly          |
-| ld    | Linking (binutils)|
-| **static** attr  | Handles fs objects |
-
-All must target **x86_64 Linux**. The binary is statically linked and has no runtime library dependencies.
-
-### Runtime
-
-- Bedrock Linux system with `/bedrock/strata/*` strata directories
-- `/bedrock/libexec/brl-repair`, `/bedrock/libexec/brl-enable`, `/bedrock/libexec/brl-apply`
-- Kernel with `pivot_root(2)` support
-
-## Installation
-
-### 1. Build
-
-```bash
-make
+[init]
+default = enux:/sbin/init       # the command after ':' is the base init
 ```
 
-Produces `build/init` (stripped, ~850KB ELF64).
+Both are optional: the base defaults to `enux` and the init to
+`/sbin/init`.
 
-### 2. Install
+## Design
 
-```bash
-sudo make install
+- **Statically linked** — no libc.so dependency; safe before ld.so is set up.
+- **Direct syscalls** — `mount(2)`, `open`/`read`; no `system()`/`popen()`.
+- **Parallel enable** — all non-base layers are `layer-enable`'d at once via
+  `fork()` + `waitpid(-1)`; the slowest layer sets the wall clock.
+- **Never-die PID 1** — any failure before the final exec falls back to a
+  backup init, then to an emergency shell.
+
+## Build
+
+```sh
+make            # build/init  (static ELF64, stripped)
+make check      # verify ELF type, static linking, forbidden symbols, ASM
+make debug      # build/init.debug with -g3 + ASan
 ```
 
-This will:
-
-1. Back up the existing init at `/bedrock/strata/bedrock/sbin/init` → `.sh.bak` (shell script) or `.bin.bak` (binary)
-2. Copy the backup to `/sbin/init` as a recovery fallback
-3. Place the init.c binary at `/bedrock/strata/bedrock/sbin/init`
-
-### 3. Fallback (optional)
-
-If there was no existing init to back up, or you want a fresh copy of the official Bedrock init:
-
-```bash
-sudo make install-fallback
-```
-
-Downloads the official Bedrock Linux shell init and saves it as both the `.sh.bak` backup and `/sbin/init`.
-
-### 4. Debug build
-
-```bash
-make debug
-```
-
-Produces `build/init.debug` with `-g3` and AddressSanitizer (unstripped).
-
-### 5. Verify
-
-```bash
-make check
-```
-
-Validates ELF type, static linking, forbidden symbols, and ASM symbol presence.
-
-## Booting
-
-On next reboot:
-
-1. init.c starts as PID 1
-2. Mounts essential filesystems (/proc, /sys, /dev, /run)
-3. Reads `/bedrock/etc/bedrock.conf` for init selection
-4. Presents an interactive menu of available stratum/init combinations (with configurable timeout)
-5. Pivots root into the chosen stratum
-6. Enables all `show_boot` strata in parallel
-7. Handles control to the stratum's real init via `execv()`
-
-### Kernel command-line shortcut
-
-```bash
-bedrock_init=stratum:/sbin/init
-```
-
-Skips the menu entirely.
-
-## Contributing
-
-Contributions are welcome via pull request.
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/my-change`)
-3. Make your changes
-4. Build and verify (`make clean && make && make check`)
-5. Commit with a descriptive message
-6. Open a pull request
-
-### Code conventions
-
-- C11 with GNU extensions (`-std=c11 -D_GNU_SOURCE`)
-- No `system()`, `popen()`, or dynamic library calls
-- Direct `write(2)` for output in signal-safe paths
-- Static helper functions where possible
-- Follow the existing style (Allman brace style, descriptive variable names)
+The binary is consumed by The ENux Layer's own `make` (it copies
+`build/init` into `/enux/sbin/init`). See that repo's `ISO.md` for how it
+ships in an ISO.
 
 ## License
 
-GPL-v3.
-
-## Note
-
-### *: May or may not be 10% all the time, but the boot speed was 18.42 seconds on my machine
-
-### **init.c** was built and tested the most on **ENux 5.3.3**. If you want to use this init on other systems, be cautious as they haven't been tested yet.
-
-### **init.c** will be the default init for **ENux** soon.
-
-### All of the benchmarks, like timing, strata boot speeds and more, have been tested on a 7 strata **ENux** system.
-
-### The system to test **init.c** consists of:
-
-- i5 12400f (12 processing units)
-- 32 GB DDR5 6000 MHz CL30
-- Gen 4 NVME (with read/write speeds of around 5000/3500 MBs)
+GPL-2.0.
