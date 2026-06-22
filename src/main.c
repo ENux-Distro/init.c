@@ -33,7 +33,7 @@ static void print_logo(void)
 {
     asm_write_str(STDOUT_FILENO,
         COL_CYAN
-        "\n  ENux 6.x  " COL_DIM "- The ENux Layer\n" COL_RESET "\n");
+        "\n  init.c  " COL_DIM "- Built for The ENux Layer\n" COL_RESET "\n");
 }
 
 /*
